@@ -1,4 +1,4 @@
-# Mini Claude Code
+# Claude Code From Scratch
 
 > 一步一步，从零造一个 Claude Code
 
