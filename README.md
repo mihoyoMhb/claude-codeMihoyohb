@@ -1,16 +1,27 @@
 # Claude Code From Scratch
 
+[![GitHub stars](https://img.shields.io/github/stars/Windy3f3f3f3f/claude-code-from-scratch?style=social)](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](#)
+[![Lines of Code](https://img.shields.io/badge/~1300_lines-minimal-green)](#)
+
 > 一步一步，从零造一个 Claude Code
 
-[English](./README_EN.md)
+<p align="center">
+  <a href="https://windy3f3f3f3f.github.io/claude-code-from-scratch/"><strong>📘 在线阅读教程 →</strong></a>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="./README_EN.md">English</a>
+</p>
+
+> 📖 **想深入了解原理？** 姊妹项目 **[How Claude Code Works](https://github.com/Windy3f3f3f3f/how-claude-code-works)** — 12 篇专题，33 万字，从源码级别深度解析 Claude Code 架构
+
+---
 
 **用 ~1300 行 TypeScript 复现 Claude Code 的核心能力。** 这不是 demo，而是一份分步教程——每一步都对照 Claude Code 真实源码讲解"它怎么做的 → 我们怎么简化的"，帮你彻底理解 coding agent 的工作原理。
 
 <video src="https://github.com/user-attachments/assets/4f6597e2-6ea3-45ae-8a6b-77662c4e9540" width="100%" autoplay loop muted playsinline></video>
 
 ## 分步教程
-
-**[在线阅读 →](https://windy3f3f3f3f.github.io/claude-code-from-scratch/)**
 
 8 章内容，从核心循环到完整 CLI，每章都贴真实代码 + Claude Code 源码对照：
 
@@ -83,6 +94,17 @@ mini-claude                  # 直接启动
 | `/cost` | 显示累计 token 用量和费用估算 |
 | `/compact` | 手动触发对话压缩 |
 
+## 与 Claude Code 的对比
+
+| 维度 | Claude Code | Mini Claude Code |
+|------|------------|-----------------|
+| 定位 | 生产级编程智能体 | 教学 / 最小可用实现 |
+| 工具数量 | 66+ 内置工具 | 6 个核心工具 |
+| 上下文管理 | 4 级压缩流水线 | Token 追踪 + 自动压缩 |
+| 流式输出 | Ink/React 渲染 | 原生流式打印 |
+| 安全机制 | 5 层权限系统 | 基本危险命令确认 |
+| 代码量 | 50 万+ 行 | ~1300 行 |
+
 ## 核心能力
 
 - **Agent 循环**：自动调用工具、处理结果、持续迭代，直到任务完成
@@ -92,6 +114,19 @@ mini-claude                  # 直接启动
 - **安全确认**：危险命令需要用户确认，`--yolo` 模式可跳过
 - **会话持久化**：自动保存对话，`--resume` 恢复上次会话
 - **错误恢复**：API 限流/过载时指数退避重试，Ctrl+C 优雅中断
+
+## 项目结构
+
+```
+src/
+├── cli.ts      # CLI 入口：参数解析、REPL、Ctrl+C     (209 行)
+├── agent.ts    # Agent 循环：流式输出、重试、压缩      (620 行)
+├── tools.ts    # 工具定义与实现：6 工具 + 截断保护     (304 行)
+├── prompt.ts   # System Prompt：模板 + 环境注入        (65 行)
+├── session.ts  # 会话持久化：保存/恢复/列表            (63 行)
+└── ui.ts       # 终端输出：彩色显示、格式化            (102 行)
+                                          总计: ~1300 行
+```
 
 ## 架构图
 
@@ -122,33 +157,9 @@ mini-claude                  # 直接启动
 任务完成 → 自动保存会话
 ```
 
-## 与 Claude Code 的对比
-
-| 维度 | Claude Code | Mini Claude Code |
-|------|------------|-----------------|
-| 定位 | 生产级编程智能体 | 教学 / 最小可用实现 |
-| 工具数量 | 66+ 内置工具 | 6 个核心工具 |
-| 上下文管理 | 4 级压缩流水线 | Token 追踪 + 自动压缩 |
-| 流式输出 | Ink/React 渲染 | 原生流式打印 |
-| 安全机制 | 5 层权限系统 | 基本危险命令确认 |
-| 代码量 | 50 万+ 行 | ~1300 行 |
-
-## 项目结构
-
-```
-src/
-├── cli.ts      # CLI 入口：参数解析、REPL、Ctrl+C     (209 行)
-├── agent.ts    # Agent 循环：流式输出、重试、压缩      (620 行)
-├── tools.ts    # 工具定义与实现：6 工具 + 截断保护     (304 行)
-├── prompt.ts   # System Prompt：模板 + 环境注入        (65 行)
-├── session.ts  # 会话持久化：保存/恢复/列表            (63 行)
-└── ui.ts       # 终端输出：彩色显示、格式化            (102 行)
-                                          总计: ~1300 行
-```
-
 ## 相关项目
 
-- [how-claude-code-works](https://github.com/Windy3f3f3f3f/how-claude-code-works) — Claude Code 源码架构深度解析
+- **[how-claude-code-works](https://github.com/Windy3f3f3f3f/how-claude-code-works)** — Claude Code 源码架构深度解析（12 篇专题，33 万字）
 
 ## 致谢
 

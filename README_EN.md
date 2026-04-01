@@ -1,16 +1,27 @@
-# Mini Claude Code
+# Claude Code From Scratch
+
+[![GitHub stars](https://img.shields.io/github/stars/Windy3f3f3f3f/claude-code-from-scratch?style=social)](https://github.com/Windy3f3f3f3f/claude-code-from-scratch)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](#)
+[![Lines of Code](https://img.shields.io/badge/~1300_lines-minimal-green)](#)
 
 > Build Claude Code from scratch, step by step
 
-[中文](./README.md)
+<p align="center">
+  <a href="https://windy3f3f3f3f.github.io/claude-code-from-scratch/"><strong>📘 Read Tutorial Online →</strong></a>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="./README.md">中文</a>
+</p>
+
+> 📖 **Want to understand the internals?** Companion project **[How Claude Code Works](https://github.com/Windy3f3f3f3f/how-claude-code-works)** — 12 deep-dive articles, 338K characters, source-level analysis of Claude Code's architecture
+
+---
 
 **Recreate Claude Code's core capabilities in ~1300 lines of TypeScript.** This isn't a demo — it's a step-by-step tutorial where each chapter compares Claude Code's real source with our simplified implementation, helping you truly understand how coding agents work.
 
 <video src="https://github.com/Windy3f3f3f3f/claude-code-from-scratch/raw/main/demo.mp4" width="100%" autoplay loop muted playsinline></video>
 
 ## Step-by-Step Tutorial
-
-**[Read Online →](https://windy3f3f3f3f.github.io/claude-code-from-scratch/)**
 
 8 chapters, from core loop to complete CLI. Each chapter includes real code + Claude Code source comparison:
 
@@ -83,6 +94,17 @@ mini-claude                  # Launch directly
 | `/cost` | Show cumulative token usage and cost |
 | `/compact` | Manually trigger conversation compaction |
 
+## Comparison with Claude Code
+
+| Aspect | Claude Code | Mini Claude Code |
+|--------|------------|-----------------|
+| Purpose | Production coding agent | Educational / minimal |
+| Tools | 66+ built-in | 6 core tools |
+| Context | 4-level compression | Token tracking + auto-compact |
+| Streaming | Ink/React rendering | Native stream printing |
+| Security | 5-layer permission system | Basic command confirmation |
+| Code Size | 500k+ lines | ~1300 lines |
+
 ## Core Capabilities
 
 - **Agent Loop**: Automatically calls tools, processes results, iterates until done
@@ -92,6 +114,19 @@ mini-claude                  # Launch directly
 - **Safe by Default**: Dangerous commands require confirmation; `--yolo` to skip
 - **Session Persistence**: Auto-save conversations, `--resume` to restore
 - **Error Recovery**: Exponential backoff retry on rate limits, graceful Ctrl+C
+
+## Project Structure
+
+```
+src/
+├── cli.ts      # CLI entry: args, REPL, Ctrl+C         (209 lines)
+├── agent.ts    # Agent loop: streaming, retry, compact  (620 lines)
+├── tools.ts    # Tool definitions: 6 tools + truncation (304 lines)
+├── prompt.ts   # System prompt: template + env inject   (65 lines)
+├── session.ts  # Session persistence: save/load/list    (63 lines)
+└── ui.ts       # Terminal output: colors, formatting    (102 lines)
+                                              Total: ~1300 lines
+```
 
 ## Architecture
 
@@ -122,33 +157,9 @@ User Input
 Task Complete → Auto-save Session
 ```
 
-## Comparison with Claude Code
-
-| Aspect | Claude Code | Mini Claude Code |
-|--------|------------|-----------------|
-| Purpose | Production coding agent | Educational / minimal |
-| Tools | 66+ built-in | 6 core tools |
-| Context | 4-level compression | Token tracking + auto-compact |
-| Streaming | Ink/React rendering | Native stream printing |
-| Security | 5-layer permission system | Basic command confirmation |
-| Code Size | 500k+ lines | ~1300 lines |
-
-## Project Structure
-
-```
-src/
-├── cli.ts      # CLI entry: args, REPL, Ctrl+C         (209 lines)
-├── agent.ts    # Agent loop: streaming, retry, compact  (620 lines)
-├── tools.ts    # Tool definitions: 6 tools + truncation (304 lines)
-├── prompt.ts   # System prompt: template + env inject   (65 lines)
-├── session.ts  # Session persistence: save/load/list    (63 lines)
-└── ui.ts       # Terminal output: colors, formatting    (102 lines)
-                                              Total: ~1300 lines
-```
-
 ## Related Projects
 
-- [how-claude-code-works](https://github.com/Windy3f3f3f3f/how-claude-code-works) — Deep dive into Claude Code's architecture
+- **[how-claude-code-works](https://github.com/Windy3f3f3f3f/how-claude-code-works)** — Deep dive into Claude Code's architecture (12 articles, 338K characters)
 
 ## License
 
