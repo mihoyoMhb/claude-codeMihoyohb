@@ -5,24 +5,24 @@
 防止对话历史超出 LLM 的上下文窗口：4 层分级压缩管道，从轻量级截断到全量摘要逐级递进。
 
 ```mermaid
-graph TB
-    subgraph "第0层：执行时截断"
-        Tool[工具执行结果] --> Trunc{"&gt; 50K 字符?"}
-        Trunc -->|是| Cut["截断：保留头尾"]
-        Trunc -->|否| Pass[直接返回]
-    end
+graph TD
+    Tool[工具执行结果] --> Trunc{"&gt; 50K 字符?"}
+    Trunc -->|是| Cut["截断：保留头尾"]
+    Trunc -->|否| Pass[直接返回]
+    Cut --> T1
+    Pass --> T1
 
-    subgraph "4层压缩管道（每次 API 调用前）"
-        T1[Tier 1: Budget] -->|"50-70%: 30K<br/>70-85%: 15K"| T2[Tier 2: Snip]
-        T2 -->|"同文件重复读取<br/>旧搜索结果"| T3[Tier 3: Microcompact]
-        T3 -->|"空闲 &gt;5min<br/>cache 已冷"| T4[Tier 4: Auto-compact]
-        T4 -->|"&gt;85% 窗口"| Summary[LLM 摘要替换]
-    end
+    T1["Tier 1: Budget<br/>预算截断"] -->|"50-70%: 30K<br/>70-85%: 15K"| T2["Tier 2: Snip<br/>裁剪重复"]
+    T2 -->|"同文件重复读取<br/>旧搜索结果"| T3["Tier 3: Microcompact<br/>微压缩"]
+    T3 -->|"空闲 &gt;5min<br/>cache 已冷"| T4["Tier 4: Auto-compact<br/>全量摘要"]
+    T4 -->|"&gt;85% 窗口"| Summary[LLM 摘要替换]
 
+    style Trunc fill:#e8e0ff
     style T1 fill:#e8e0ff
     style T2 fill:#e8e0ff
     style T3 fill:#e8e0ff
     style T4 fill:#7c5cfc,color:#fff
+    style Summary fill:#7c5cfc,color:#fff
 ```
 
 ## Claude Code 怎么做的
