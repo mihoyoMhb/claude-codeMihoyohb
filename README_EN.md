@@ -70,6 +70,20 @@ export OPENAI_API_KEY="sk-xxx"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
+**Option 3: Local Ollama (OpenAI-Compatible)**
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
+export OPENAI_API_KEY="ollama"
+export MINI_CLAUDE_MODEL="pielee/qwen3-4b-thinking-2507_q8"
+```
+
+Or use the helper script:
+
+```bash
+bash ./scripts/run_with_ollama.sh
+```
+
 Default model is `claude-opus-4-6`. Customize via env var or CLI flag:
 
 ```bash
