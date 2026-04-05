@@ -2,7 +2,7 @@
 
 import * as readline from "readline";
 import { Agent } from "./agent.js";
-import { printWelcome, printUserPrompt, printError, printInfo } from "./ui.js";
+import { printWelcome, printUserPrompt, printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
 import { loadSession, getLatestSessionId } from "./session.js";
 import { listMemories, recallMemories } from "./memory.js";
 import { discoverSkills, resolveSkillPrompt, getSkillByName, executeSkill } from "./skills.js";
@@ -121,6 +121,35 @@ async function runRepl(agent: Agent) {
       rl.question("  Allow? (y/n): ", (answer) => {
         resolve(answer.toLowerCase().startsWith("y"));
       });
+    });
+  });
+
+  // Plan approval callback: interactive multi-option selection
+  agent.setPlanApprovalFn((planContent: string) => {
+    return new Promise((resolve) => {
+      printPlanForApproval(planContent);
+      printPlanApprovalOptions();
+
+      const askChoice = () => {
+        rl.question("  Enter choice (1-4): ", (answer) => {
+          const choice = answer.trim();
+          if (choice === "1") {
+            resolve({ choice: "clear-and-execute" });
+          } else if (choice === "2") {
+            resolve({ choice: "execute" });
+          } else if (choice === "3") {
+            resolve({ choice: "manual-execute" });
+          } else if (choice === "4") {
+            rl.question("  Feedback (what to change): ", (feedback) => {
+              resolve({ choice: "keep-planning", feedback: feedback.trim() || undefined });
+            });
+          } else {
+            console.log("  Invalid choice. Enter 1, 2, 3, or 4.");
+            askChoice();
+          }
+        });
+      };
+      askChoice();
     });
   });
 

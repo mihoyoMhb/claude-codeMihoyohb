@@ -7,9 +7,9 @@
     "mini-claude": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc && cp src/system-prompt.md dist/",
+    "build": "tsc",
     "start": "node dist/cli.js",
-    "dev": "tsc && cp src/system-prompt.md dist/ && node dist/cli.js"
+    "dev": "tsc && node dist/cli.js"
   },
   "keywords": [
     "claude-code",

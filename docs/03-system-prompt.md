@@ -6,10 +6,13 @@
 
 ```mermaid
 graph TB
-    Template[system-prompt.md<br/>Markdown 模板] --> Builder[buildSystemPrompt<br/>变量替换]
+    Template[SYSTEM_PROMPT_TEMPLATE<br/>内联 Markdown 模板] --> Builder[buildSystemPrompt<br/>变量替换]
     CWD[工作目录] --> Builder
     Git[Git 信息] --> Builder
     ClaudeMD[CLAUDE.md<br/>项目指令] --> Builder
+    Memory[记忆系统] --> Builder
+    Skills[技能描述] --> Builder
+    Agents[Agent 描述] --> Builder
     Builder --> Final[最终 System Prompt]
     Final --> API[传给 API<br/>system 参数]
 
@@ -19,51 +22,78 @@ graph TB
 
 ## Claude Code 怎么做的
 
-Claude Code 的 System Prompt 构造在 `src/constants/prompts.ts` 的 `getSystemPrompt()` 函数中：
+Claude Code 的 System Prompt 不是随意堆砌的指令，而是经过大量 A/B 测试和模型行为观察迭代打磨的工程产物。
 
-### 8 个章节，分两类
+### 7 层递进结构
 
-```typescript
-// src/constants/prompts.ts — getSystemPrompt()
-function getSystemPrompt() {
-  return [
-    // ── Static（全局缓存，不随会话变化）──
-    IDENTITY,           // 身份声明
-    SAFETY_INSTRUCTIONS, // 安全指令（来自 cyberRiskInstruction.ts）
-    SYSTEM_RULES,       // 系统规则
-    TOOL_USAGE,         // 工具使用策略
-    TONE_STYLE,         // 语气和风格
-    OUTPUT_EFFICIENCY,  // 输出效率
-
-    // ── Dynamic（每会话不同）──
-    ENVIRONMENT_INFO,   // 平台、shell、git 状态
-    CLAUDE_MD_CONTENT,  // 项目指令文件
-  ].join("\n\n");
-}
-```
-
-**缓存分界**：`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 标记 static/dynamic 的分界线。Anthropic API 支持 prompt caching，static 部分可以跨会话缓存，节省 token 计费。
-
-### CLAUDE.md 层级发现 — `src/utils/claudemd.ts`
-
-Claude Code 从 4 个位置收集 `CLAUDE.md`：
+提示词从抽象到具体分为 7 层——**先建立身份和约束框架，再填充具体行为指导**。这个顺序很重要：模型先建立的概念会成为理解后续内容的框架。
 
 ```
-~/.claude/CLAUDE.md          ← 用户全局
-$PROJECT_ROOT/CLAUDE.md      ← 项目根目录
-$PROJECT_ROOT/.claude/CLAUDE.md ← 项目 .claude 目录
-$CWD/CLAUDE.md               ← 当前工作目录（可能嵌套）
-+ 所有父目录的 CLAUDE.md
+1. Identity   → 我是谁？interactive agent
+2. System     → 运行环境的基本事实
+3. Doing Tasks → 怎么写代码？（反模式接种）
+4. Actions    → 哪些操作需要确认？（爆炸半径框架）
+5. Using Tools → 怎么用工具？（偏好映射表）
+6. Tone & Style → 输出什么格式？
+7. Output Efficiency → 怎么更简洁？
 ```
+
+### 反模式接种
+
+**明确告诉模型"不要做什么"，比只描述"要做什么"有效得多。**
+
+正面指令（"be concise"）给模型留下了自我合理化的空间——它会认为"加注释是让代码更简洁易读的"，然后给每个函数加 docstring。而负面指令（"don't add docstrings to code you didn't change"）消除了解释余地。
+
+Claude Code 的 Doing Tasks 部分有三条精确的"不要"：
+
+- **不要扩大范围**：修 bug 不需要顺手重构周围代码
+- **不要防御性编程**：不为不可能发生的场景加 try-catch 和校验
+- **不要过早抽象**："Three similar lines of code is better than a premature abstraction"
+
+这些规则的价值不在概念（谁都知道"不要过度工程"），而在**措辞的精确度**——给了模型具体的判断标准，而非模糊的原则。
+
+### 爆炸半径框架
+
+Actions 部分没有罗列"不能做 X、Y、Z"，而是教给模型一个**风险评估框架**：
+
+```
+Carefully consider the reversibility and blast radius of actions.
+```
+
+二维模型：**可逆性 × 影响范围**。高风险 = 不可逆 + 影响共享环境（force push、删除云资源）；低风险 = 可逆 + 只影响本地（编辑本地文件）。
+
+这比穷举规则扩展性强得多——模型遇到规则列表之外的新场景（比如调用 API 删除云资源）能自行推理，而不是不知道怎么做。
+
+还有一条关键规则：用户批准一次操作，不等于批准所有类似操作。每次授权只对当前范围有效。
+
+### 工具偏好映射表
+
+Claude Code 在提示词中明确要求模型用专用工具而非 bash 命令：
+
+```
+Use Read instead of cat/head/tail
+Use Edit instead of sed/awk
+Use Glob instead of find/ls
+Use Grep instead of grep/rg
+```
+
+专用工具和 bash 命令底层功能差不多，差异在用户体验：权限可以细粒度控制（读取 vs 写入分开授权）、输出结构化、原生支持并行调用。没有这张映射表，模型会默认用训练数据中出现最多的方式——即各种 bash 命令。
+
+### CLAUDE.md 层级发现
+
+CLAUDE.md 是项目级指令文件，类似 `.eslintrc` 但面向 AI。Claude Code 从 5 个位置加载：全局管理策略 → 用户主目录 → 项目目录（CWD 向上遍历）→ 本地文件 → 命令行指定目录。
+
+靠近 CWD 的文件**后加载、优先级更高**——利用 LLM 的近因效应，子目录规则可以覆盖父目录规则。
 
 ## 我们的实现
 
-### 模板文件：system-prompt.md
+### SYSTEM_PROMPT_TEMPLATE
 
-我们用 Markdown 写 System Prompt 模板，用 `{{placeholder}}` 标记变量：
+模板内联在 `prompt.ts` 中，用 `{{placeholder}}` 标记动态变量：
 
-```markdown
-You are Mini Claude Code, a lightweight coding assistant CLI.
+```typescript
+const SYSTEM_PROMPT_TEMPLATE = `You are Mini Claude Code, a lightweight coding assistant CLI.
+You are an interactive agent that helps users with software engineering tasks.
 
 # System
  - All text you output outside of tool use is displayed to the user.
@@ -75,25 +105,34 @@ You are Mini Claude Code, a lightweight coding assistant CLI.
  - Do not propose changes to code you haven't read. Read files first.
  - Do not create files unless absolutely necessary.
  - Avoid over-engineering. Only make changes directly requested.
-   - Don't add features beyond what was asked.
-   - Don't create helpers for one-time operations.
- - Be careful not to introduce security vulnerabilities.
+   - Don't add features, refactor code, or make "improvements" beyond what was asked.
+   - Don't add error handling for scenarios that can't happen.
+   - Don't create helpers for one-time operations. Three similar lines > premature abstraction.
 
 # Executing actions with care
- - Freely take local, reversible actions like editing files or running tests.
- - For destructive or shared-system actions, check with the user first.
+Carefully consider the reversibility and blast radius of actions.
+Prefer reversible over irreversible. When in doubt, confirm with the user.
+High-risk: destructive ops (rm -rf, drop table), hard-to-reverse ops (force push, reset --hard),
+externally visible ops (push, create PR), content uploads.
+User approving an action once does NOT mean they approve it in all contexts.
 
 # Using your tools
  - Use read_file instead of cat/head/tail
  - Use edit_file instead of sed/awk (prefer over write_file for existing files)
- - Use write_file only for new files
  - Use list_files instead of find/ls
- - Use grep_search instead of grep
- - Reserve run_shell for actual shell operations
+ - Use grep_search instead of grep/rg
+ - Use the agent tool for parallelizing independent queries
+ - If multiple tool calls are independent, make them in parallel.
 
 # Tone and style
  - Only use emojis if the user explicitly requests it.
- - Be short and concise. Go straight to the point.
+ - Responses should be short and concise.
+ - When referencing code include file_path:line_number format.
+ - Don't add a colon before tool calls.
+
+# Output efficiency
+IMPORTANT: Go straight to the point. Lead with conclusions, reasoning after.
+Skip filler phrases. One sentence where one sentence suffices.
 
 # Environment
 Working directory: {{cwd}}
@@ -102,20 +141,25 @@ Platform: {{platform}}
 Shell: {{shell}}
 {{git_context}}
 {{claude_md}}
+{{memory}}
+{{skills}}
+{{agents}}`;
 ```
 
-### Prompt 构造器：prompt.ts
+`{{memory}}`、`{{skills}}`、`{{agents}}` 放在末尾——近因效应，这些动态内容的权重更大（详见第 8、9 章）。
 
+### prompt.ts 实现
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// prompt.ts — 完整实现
-
 import { readFileSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { execSync } from "child_process";
 import * as os from "os";
-import { fileURLToPath } from "url";
-
-// ─── CLAUDE.md loader ────────────────────────────────────────
+import { buildMemoryPromptSection } from "./memory.js";
+import { buildSkillDescriptions } from "./skills.js";
+import { buildAgentDescriptions } from "./subagent.js";
 
 export function loadClaudeMd(): string {
   const parts: string[] = [];
@@ -123,20 +167,16 @@ export function loadClaudeMd(): string {
   while (true) {
     const file = join(dir, "CLAUDE.md");
     if (existsSync(file)) {
-      try {
-        parts.unshift(readFileSync(file, "utf-8"));
-      } catch {}
+      try { parts.unshift(readFileSync(file, "utf-8")); } catch {}
     }
     const parent = resolve(dir, "..");
-    if (parent === dir) break;  // 到达根目录
+    if (parent === dir) break;
     dir = parent;
   }
   return parts.length > 0
     ? "\n\n# Project Instructions (CLAUDE.md)\n" + parts.join("\n\n---\n\n")
     : "";
 }
-
-// ─── Git context ─────────────────────────────────────────────
 
 export function getGitContext(): string {
   try {
@@ -149,78 +189,106 @@ export function getGitContext(): string {
     if (status) result += `\nGit status:\n${status}`;
     return result;
   } catch {
-    return "";  // 不在 git 仓库中，静默忽略
+    return "";
   }
 }
 
-// ─── System prompt builder ───────────────────────────────────
-
 export function buildSystemPrompt(): string {
-  const __dirname = fileURLToPath(new URL(".", import.meta.url));
-  const template = readFileSync(join(__dirname, "system-prompt.md"), "utf-8");
-
   const date = new Date().toISOString().split("T")[0];
   const platform = `${os.platform()} ${os.arch()}`;
-  const shell = process.env.SHELL || "unknown";
-  const gitContext = getGitContext();
-  const claudeMd = loadClaudeMd();
+  const shell = process.platform === "win32"
+    ? (process.env.ComSpec || "cmd.exe")
+    : (process.env.SHELL || "/bin/sh");
 
-  return template
-    .replace("{{cwd}}", process.cwd())
-    .replace("{{date}}", date)
-    .replace("{{platform}}", platform)
-    .replace("{{shell}}", shell)
-    .replace("{{git_context}}", gitContext)
-    .replace("{{claude_md}}", claudeMd);
+  return SYSTEM_PROMPT_TEMPLATE
+    .split("{{cwd}}").join(process.cwd())
+    .split("{{date}}").join(date)
+    .split("{{platform}}").join(platform)
+    .split("{{shell}}").join(shell)
+    .split("{{git_context}}").join(getGitContext())
+    .split("{{claude_md}}").join(loadClaudeMd())
+    .split("{{memory}}").join(buildMemoryPromptSection())
+    .split("{{skills}}").join(buildSkillDescriptions())
+    .split("{{agents}}").join(buildAgentDescriptions());
 }
 ```
+#### **Python**
+```python
+import os
+import platform
+import subprocess
+from pathlib import Path
 
-### Prompt 设计的关键决策
 
-#### "优先 edit_file" 规则
+def load_claude_md() -> str:
+    parts: list[str] = []
+    d = Path.cwd().resolve()
+    while True:
+        f = d / "CLAUDE.md"
+        if f.is_file():
+            try:
+                parts.insert(0, f.read_text())
+            except Exception:
+                pass
+        parent = d.parent
+        if parent == d:
+            break
+        d = parent
+    if parts:
+        return "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
+    return ""
 
+
+def get_git_context() -> str:
+    try:
+        opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True}
+        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **opts).stdout.strip()
+        log = subprocess.run(["git", "log", "--oneline", "-5"], **opts).stdout.strip()
+        status = subprocess.run(["git", "status", "--short"], **opts).stdout.strip()
+        result = f"\nGit branch: {branch}"
+        if log:
+            result += f"\nRecent commits:\n{log}"
+        if status:
+            result += f"\nGit status:\n{status}"
+        return result
+    except Exception:
+        return ""
+
+
+def build_system_prompt() -> str:
+    from .memory import build_memory_prompt_section
+    from .skills import build_skill_descriptions
+    from .subagent import build_agent_descriptions
+    from datetime import date
+
+    replacements = {
+        "{{cwd}}": str(Path.cwd()),
+        "{{date}}": date.today().isoformat(),
+        "{{platform}}": f"{platform.system()} {platform.machine()}",
+        "{{shell}}": os.environ.get("SHELL", "/bin/sh"),
+        "{{git_context}}": get_git_context(),
+        "{{claude_md}}": load_claude_md(),
+        "{{memory}}": build_memory_prompt_section(),
+        "{{skills}}": build_skill_descriptions(),
+        "{{agents}}": build_agent_descriptions(),
+    }
+    result = SYSTEM_PROMPT_TEMPLATE
+    for key, value in replacements.items():
+        result = result.replace(key, value)
+    return result
 ```
-Use edit_file instead of sed/awk (prefer over write_file for existing files)
-```
+<!-- tabs:end -->
 
-为什么？因为 `write_file` 会覆盖整个文件。如果 LLM 用 `write_file` 修改一个 500 行的文件，它需要准确重写全部 500 行——这容易丢失内容。`edit_file` 只替换目标片段，风险小得多。
+### 简化取舍
 
-Claude Code 的 System Prompt 有同样的指令，甚至更强调这一点。
-
-#### "不要过度工程" 指令
-
-```
-Avoid over-engineering. Only make changes directly requested.
-Don't add features beyond what was asked.
-Don't create helpers for one-time operations.
-```
-
-LLM 天然倾向于"完善"代码——加错误处理、加注释、重构。这些在 coding agent 场景下是有害的，因为用户只想完成一个具体任务，不希望看到一堆意外的改动。
-
-#### 环境信息的作用
-
-```
-Working directory: /home/user/project
-Git branch: feature/auth
-Recent commits:
-  a1b2c3d Add login form
-  e4f5g6h Setup project
-```
-
-这些信息帮助 LLM 理解上下文——它在哪个项目、哪个分支、最近做了什么。不需要 LLM 自己去执行 `git status`，减少不必要的工具调用。
-
-## 简化对比
-
-| 维度 | Claude Code | mini-claude |
-|------|------------|-------------|
-| **Prompt 存储** | 代码中硬编码的字符串常量 | Markdown 模板文件 |
-| **章节数** | 8 个（含安全指令） | 8 个（对齐） |
-| **缓存优化** | static/dynamic 分界 + API 缓存 | 无 |
-| **CLAUDE.md 发现** | 4 个位置 + .claude 子目录 | 从 cwd 向上遍历 |
-| **环境信息** | 详细（含 IDE、hooks、MCPs） | 基础（cwd + git + platform） |
-| **安全指令** | 独立文件 cyberRiskInstruction.ts | 内联在模板中 |
-| **变量替换** | 字符串拼接 | `{{placeholder}}` 模板 |
-| **代码量** | ~500 行（prompts.ts + claudemd.ts） | ~65 行 |
+| Claude Code | mini-claude | 理由 |
+|------------|-------------|------|
+| Static/Dynamic 缓存边界 | 不实现 | 教程项目无需优化 API 成本 |
+| CLAUDE.md 5 层发现 + .claude 子目录 | 只从 CWD 向上遍历 | 覆盖最常见场景 |
+| @include 指令 | 不实现 | 增加复杂度，收益低 |
+| 反模式接种（3 条规则） | 完整保留 | 对输出质量影响极大 |
+| 爆炸半径框架 | 完整保留 | 安全性不能简化 |
+| 工具偏好映射表 | 适配工具名保留 | 必须有，否则模型默认用 bash |
 
 ---
 

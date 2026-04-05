@@ -35,56 +35,169 @@ graph LR
 
 ## Claude Code 怎么做的
 
-Claude Code 的工具系统是一个重度抽象的类体系：
+### Tool 接口 — 每个工具的完整契约
 
-### Tool 抽象类 — `src/Tool.ts`
-
-每个工具继承 `Tool` 抽象类，实现 4 个方法：
+Claude Code 的每个工具都遵循统一的 `Tool` 泛型接口，不是简单函数签名，而是完整的行为契约：
 
 ```typescript
-abstract class Tool {
-  abstract description(): string;          // 工具描述
-  abstract prompt(): Promise<string>;      // 动态 prompt（可含上下文）
-  abstract validateInput(input): boolean;  // 输入校验
-  abstract call(input, context): Promise<ToolResult>;  // 执行
+type Tool<Input, Output, P extends ToolProgressData> = {
+  name: string
+  aliases?: string[]              // 废弃别名，平滑迁移
+  maxResultSizeChars: number      // 超过则持久化到磁盘
+
+  call(args, context, canUseTool, parentMessage, onProgress?): Promise<ToolResult<Output>>
+
+  description(input, options): Promise<string>  // 发给 API 的工具描述
+  prompt(options): Promise<string>              // 注入 system prompt 的使用指南
+
+  inputSchema: Input              // Zod Schema（运行时验证 + 类型推导）
+  inputJSONSchema?: ToolInputJSONSchema
+
+  isConcurrencySafe(input): boolean   // 接收 input：同一工具不同参数可有不同安全语义
+  isReadOnly(input): boolean
+  isDestructive?(input): boolean
+  checkPermissions(input, context): Promise<PermissionResult>
+
+  renderToolUseMessage(input, options): React.ReactNode  // 每个工具自带渲染
+  renderToolResultMessage?(content, progress, options): React.ReactNode
 }
 ```
 
-### 工具注册 — `src/tools.ts`
+几个设计要点：
 
-66+ 工具在 `tools.ts` 中注册，每个工具一个独立目录：
+**`isConcurrencySafe(input)` 接收参数**——这意味着同一工具对不同输入可以有不同安全语义。BashTool 对 `ls` 返回 `isReadOnly: true`，对 `rm` 返回 `false`。比给整个工具打标签精确得多。
 
-```
-src/tools/
-  BashTool/        — Shell 命令（含 AST 安全分析）
-  FileReadTool/    — 读文件（支持行范围、PDF、图片）
-  FileEditTool/    — 编辑文件（精确匹配替换）
-  FileWriteTool/   — 写文件
-  GlobTool/        — 文件搜索
-  GrepTool/        — 内容搜索
-  AgentTool/       — 子代理
-  NotebookEditTool/ — Jupyter 编辑
-  ... 共 66+ 工具
-```
+**`prompt()` 方法**——每个工具可以向 system prompt 注入自己的使用指南。FileEditTool 注入"精确匹配"规则，BashTool 注入安全执行提醒。工具行为指引和工具定义紧密关联，而非散落在全局 prompt 文件里。
 
-### StreamingToolExecutor
+**渲染方法**——每个工具自带渲染逻辑，新增工具不需要修改全局渲染代码。
 
-当 LLM 一次返回多个 tool_use，Claude Code 使用 `StreamingToolExecutor` 并发执行，但按原始顺序返回结果：
+### buildTool 工厂 — Fail-Closed 默认值
 
 ```typescript
-// 并发执行，顺序返回
-const executor = new StreamingToolExecutor(toolCalls);
-for await (const result of executor) {
-  yield result; // 按原始 index 顺序
+const TOOL_DEFAULTS = {
+  isConcurrencySafe: () => false,    // 默认不可并发
+  isReadOnly: () => false,           // 默认有写入副作用
+  isDestructive: () => false,
+  checkPermissions: () => ({ behavior: 'allow', updatedInput }),
 }
 ```
+
+这是 **fail-closed** 设计：错误标记"只读"工具为"非只读"后果是不必要的权限弹窗（烦人但安全）；反向错误——错误标记"写入"工具为"只读"——可能让它在没有权限检查的情况下并发执行（危险且隐蔽）。默认值只能选安全的方向。
+
+### 工具注册 — 三层流水线
+
+```mermaid
+flowchart TD
+    L1["Layer 1: getAllBaseTools()<br/>核心工具直接 import<br/>+ Feature-gated 条件导入"] --> L2["Layer 2: getTools()<br/>运行时上下文过滤<br/>SIMPLE模式 / deny规则 / isEnabled()"]
+    L2 --> L3["Layer 3: assembleToolPool()<br/>内置工具 + MCP桥接工具<br/>分区排序 + 去重"]
+    L3 --> Final[最终工具池]
+```
+
+Layer 1 的 Feature-gated 工具通过条件 `require()` 加载：
+
+```typescript
+const SleepTool = feature('PROACTIVE') || feature('KAIROS')
+  ? require('./tools/SleepTool/SleepTool.js').SleepTool
+  : null
+```
+
+`feature()` 是 Bun 打包器的编译时宏。外部构建时求值为 `false`，整个 `require()` 被死代码消除——内部工具在外部二进制中物理上不存在。
+
+Layer 3 的分区排序：内置工具按字母序在前，MCP 工具追加在后，不做全局排序。原因是 API 服务器在最后一个内置工具之后设置了缓存断点，分区确保添加 MCP 工具不影响内置工具的缓存命中。
+
+### 工具执行生命周期 — 8 个阶段
+
+```mermaid
+flowchart TD
+    Input[模型输出 tool_use block] --> Find["1. 工具查找"]
+    Find --> Validate["2. 输入验证（Zod + 业务逻辑）"]
+    Validate --> Parallel["3. 并行启动"]
+
+    subgraph 并行
+        Hook["Pre-Tool Hook"]
+        Classifier["Bash 安全分类器"]
+    end
+
+    Parallel --> Hook
+    Parallel --> Classifier
+    Hook --> Perm["4. 权限检查（Hook→工具→规则→分类器→交互确认）"]
+    Classifier --> Perm
+
+    Perm --> Exec["5. tool.call()（流式进度）"]
+    Exec --> Result["6. 结果处理（大结果持久化到磁盘）"]
+    Result --> PostHook["7. Post-Tool Hook"]
+    PostHook --> Emit["8. tool_result 返回给模型"]
+```
+
+几个值得关注的阶段：
+
+**Stage 2 两阶段验证**：Phase 1 是 Zod Schema（字段类型），Phase 2 是业务逻辑（如 FileEditTool 检查 old_string 是否唯一）。分离确保低成本检查先执行，减少不必要的磁盘 I/O。
+
+**Stage 3 并行启动**：Pre-Tool Hook 和 Bash 分类器同时启动，各需数十到数百毫秒，并行化降低权限检查总延迟。
+
+**Stage 6 大结果处理**：结果超过 `maxResultSizeChars` 时，完整内容保存到 `~/claude-code/tool-results/`，模型收到文件路径 + 截断指示符，需要时通过 FileReadTool 主动拉取。
+
+> **核心设计哲学：错误是数据，不是异常。** 任何阶段的错误都转换为带 `is_error: true` 的 `tool_result` 返回给模型，让模型自我纠正。
+
+### 并发控制
+
+```typescript
+private canExecuteTool(isConcurrencySafe: boolean): boolean {
+  const executingTools = this.tools.filter(t => t.status === 'executing')
+  return (
+    executingTools.length === 0 ||
+    (isConcurrencySafe && executingTools.every(t => t.isConcurrencySafe))
+  )
+}
+```
+
+规则很简单：非并发安全的工具必须独占执行；多个并发安全工具可以同时跑。`StreamingToolExecutor` 不等模型输出完所有 tool_use blocks，一旦检测到完整 block 就立即启动执行——工具执行延迟约 1 秒，模型流式输出持续 5-30 秒，大部分工具可以完全隐藏在流式窗口内。
+
+并发上限 `MAX_TOOL_USE_CONCURRENCY = 10`。
+
+### edit_file 的核心设计
+
+FileEditTool 执行前有 14 步验证（按 I/O 成本排序：先检查内存状态，再访问磁盘），其中最关键的三个：
+
+**读取前置检查**：代码层面的强制约束，不只是 prompt 建议。未先读取文件则拒绝执行，确保模型基于文件当前状态编辑而非过时记忆。
+
+**外部修改检测**：通过 mtime 检测文件在读取后是否被外部修改（比如用户在 IDE 中编辑了同一个文件），解决真实竞争条件。
+
+**配置文件保护**：对 `.claude/settings.json` 等，验证会模拟执行编辑后做 JSON Schema 校验，防止看似合理的编辑损坏配置格式。
+
+### 为什么用 search-and-replace
+
+在确定 search-and-replace 之前，有几种备选方案：
+
+| 方案 | 致命缺陷 |
+|------|---------|
+| 行号编辑 | 位置相关：第一次插入 3 行后，后续所有行号偏移，多步编辑需要复杂重算 |
+| AST 编辑 | 语法错误的文件恰恰最需要编辑，而 AST 解析器遇到语法错误会直接报错 |
+| Unified diff | LLM 生成严格格式时表现很差：hunk header 行号、`+`/`-`/空格前缀任一出错则 patch 无法应用 |
+| 全文件重写 | 大文件浪费 Token；模型可能遗漏未修改代码；用户无法快速 review |
+| **字符串替换** | ✅ 无上述缺陷 |
+
+search-and-replace 最被低估的优势是**幻觉安全**：模型提供了一个文件中不存在的字符串，工具直接失败，模型重新读取文件纠正记忆。全文件重写则可能静默地把错误的内容写入文件。
+
+## 我们的简化决策
+
+| Claude Code 的设计 | 我们的简化 | 简化理由 |
+|-------------------|-----------|---------|
+| 66+ 工具类，每个独立目录 | 1 个文件 + 6 个函数 | 教程不需要工业级模块化 |
+| 8 阶段生命周期 | 直接 switch 分发 + 执行 | 省略 Hook、权限检查、分类器 |
+| StreamingToolExecutor 并发 | 串行逐个执行 | 避免并发复杂度 |
+| 14 步验证流水线 | 唯一性检查 + 引号容错 | 保留最关键的 2 个验证 |
+| 三级大结果限制 | 单层 50K 截断 | 足够防止上下文爆炸 |
+| MCP 7 种传输 + OAuth | 不支持 MCP | 教程聚焦核心概念 |
+
+核心理念：**保留设计哲学，砍掉工程复杂度**。
 
 ## 我们的实现
 
-我们把 66 个工具类简化为 **1 个文件 + 6 个函数**。
-
 ### 工具定义：静态数组
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 // tools.ts — 工具定义（Anthropic Tool schema 格式）
 
@@ -128,49 +241,79 @@ export const toolDefinitions: ToolDef[] = [
   // ... list_files, grep_search, run_shell
 ];
 ```
+#### **Python**
+```python
+# tools.py — 工具定义（Anthropic Tool schema 格式）
 
-这些定义直接传给 Anthropic API 的 `tools` 参数——格式完全一致，不需要任何转换。
+tool_definitions: list[ToolDef] = [
+    {
+        "name": "read_file",
+        "description": "Read the contents of a file. Returns the file content with line numbers.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The path to the file to read"},
+            },
+            "required": ["file_path"],
+        },
+    },
+    # ... write_file, edit_file, list_files, grep_search, run_shell
+]
+```
+<!-- tabs:end -->
+
+这些定义直接传给 Anthropic API 的 `tools` 参数，格式完全一致，不需要任何转换。
+
+**为什么用静态数组而非类？** Claude Code 用类体系是因为 66+ 工具需要继承、多态、独立测试。6 个工具用一个数组 + 一个 switch 就够了，简单性本身就是价值。
 
 ### 工具执行：switch 分发器
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// tools.ts — executeTool
-
 export async function executeTool(
   name: string,
   input: Record<string, any>
 ): Promise<string> {
   let result: string;
   switch (name) {
-    case "read_file":
-      result = readFile(input as { file_path: string });
-      break;
-    case "write_file":
-      result = writeFile(input as { file_path: string; content: string });
-      break;
-    case "edit_file":
-      result = editFile(input as { file_path: string; old_string: string; new_string: string });
-      break;
-    case "list_files":
-      result = await listFiles(input as { pattern: string; path?: string });
-      break;
-    case "grep_search":
-      result = grepSearch(input as { pattern: string; path?: string; include?: string });
-      break;
-    case "run_shell":
-      result = runShell(input as { command: string; timeout?: number });
-      break;
-    default:
-      return `Unknown tool: ${name}`;
+    case "read_file":   result = readFile(input as { file_path: string }); break;
+    case "write_file":  result = writeFile(input as { file_path: string; content: string }); break;
+    case "edit_file":   result = editFile(input as { file_path: string; old_string: string; new_string: string }); break;
+    case "list_files":  result = await listFiles(input as { pattern: string; path?: string }); break;
+    case "grep_search": result = grepSearch(input as { pattern: string; path?: string; include?: string }); break;
+    case "run_shell":   result = runShell(input as { command: string; timeout?: number }); break;
+    default: return `Unknown tool: ${name}`;
   }
   return truncateResult(result);  // ← 50K 字符保护
 }
 ```
+#### **Python**
+```python
+async def execute_tool(name: str, inp: dict) -> str:
+    handlers = {
+        "read_file": _read_file,
+        "write_file": _write_file,
+        "edit_file": _edit_file,
+        "list_files": _list_files,
+        "grep_search": _grep_search,
+        "run_shell": _run_shell,
+    }
+    handler = handlers.get(name)
+    if not handler:
+        return f"Unknown tool: {name}"
+    return _truncate_result(handler(inp))
+```
+<!-- tabs:end -->
+
+`default` 分支返回 `Unknown tool: ${name}` 而非抛异常——体现"错误是数据"的设计，让模型能自我纠正幻觉出的工具名。
 
 ### 逐个工具详解
 
-#### read_file — 读文件
+#### read_file
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 function readFile(input: { file_path: string }): string {
   try {
@@ -185,11 +328,25 @@ function readFile(input: { file_path: string }): string {
   }
 }
 ```
+#### **Python**
+```python
+def _read_file(inp: dict) -> str:
+    try:
+        content = Path(inp["file_path"]).read_text()
+        lines = content.split("\n")
+        numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
+        return numbered
+    except Exception as e:
+        return f"Error reading file: {e}"
+```
+<!-- tabs:end -->
 
-**为什么加行号？** 因为 `edit_file` 需要精确匹配。行号帮助 LLM 定位代码位置，但匹配时用的是实际内容字符串，不是行号。Claude Code 的 `FileReadTool` 也返回带行号的内容，格式略有不同（`cat -n` 风格）。
+加行号是为了让 LLM 定位代码位置，但 `edit_file` 匹配时用的是实际内容字符串，不是行号。
 
-#### edit_file — 编辑文件（最关键的工具）
+#### edit_file — 最关键的工具
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 function editFile(input: {
   file_path: string;
@@ -199,7 +356,7 @@ function editFile(input: {
   try {
     const content = readFileSync(input.file_path, "utf-8");
 
-    // 关键：唯一匹配检查
+    // 唯一匹配检查
     const count = content.split(input.old_string).length - 1;
     if (count === 0)
       return `Error: old_string not found in ${input.file_path}`;
@@ -214,18 +371,42 @@ function editFile(input: {
   }
 }
 ```
+#### **Python**
+```python
+def _edit_file(inp: dict) -> str:
+    try:
+        path = Path(inp["file_path"])
+        content = path.read_text()
 
-**唯一匹配检查**是 edit_file 的核心设计。Claude Code 的 `FileEditTool` 用同样的策略——`old_string` 必须在文件中恰好出现一次。如果出现 0 次（找不到）或 >1 次（歧义），都拒绝执行。
+        # 引号容错匹配
+        actual = _find_actual_string(content, inp["old_string"])
+        if not actual:
+            return f"Error: old_string not found in {inp['file_path']}"
 
-这比"按行号编辑"更可靠：行号在多步编辑中会变化，但字符串内容不会歧义。
+        count = content.count(actual)
+        if count > 1:
+            return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
 
-#### 进阶：引号容错 + Diff 输出
+        new_content = content.replace(actual, inp["new_string"], 1)
+        path.write_text(new_content)
 
-Claude Code 的 `FileEditTool` 有 14 步验证流水线，其中一个重要步骤是**引号标准化**——模型输出中经常出现 curly quotes（`""`），但源码用的是 straight quotes（`""`）。我们实现了同样的容错机制：
+        diff = _generate_diff(content, actual, inp["new_string"])
+        quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""
+        return f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}"
+    except Exception as e:
+        return f"Error editing file: {e}"
+```
+<!-- tabs:end -->
 
+唯一匹配检查是核心：出现 0 次说明模型对文件内容记忆有误（幻觉检测），出现 > 1 次则要求模型提供更多上下文来唯一标识修改点。"宁可失败也不猜测"——静默替换第一个匹配远比告知失败危险。
+
+#### 引号容错 + Diff 输出
+
+LLM 的 tokenization 可能将直引号映射为弯引号（`"` → `"`），没有容错机制这类编辑会 100% 失败。
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// tools.ts — 引号标准化
-
 function normalizeQuotes(s: string): string {
   return s
     .replace(/[\u2018\u2019\u2032]/g, "'")   // curly single → straight
@@ -233,9 +414,7 @@ function normalizeQuotes(s: string): string {
 }
 
 function findActualString(fileContent: string, searchString: string): string | null {
-  // 先尝试精确匹配
   if (fileContent.includes(searchString)) return searchString;
-  // Fallback: 标准化后匹配
   const normSearch = normalizeQuotes(searchString);
   const normFile = normalizeQuotes(fileContent);
   const idx = normFile.indexOf(normSearch);
@@ -243,19 +422,29 @@ function findActualString(fileContent: string, searchString: string): string | n
   return null;
 }
 ```
+#### **Python**
+```python
+def _normalize_quotes(s: str) -> str:
+    s = re.sub("[\u2018\u2019\u2032]", "'", s)
+    s = re.sub('[\u201c\u201d\u2033]', '"', s)
+    return s
 
-编辑成功后，生成简易 diff 输出，显示变更行号和修改内容：
-
-```typescript
-function generateDiff(oldContent, newContent, oldString, newString): string {
-  const lineNum = (oldContent.split(oldString)[0].match(/\n/g) || []).length + 1;
-  // @@ -lineNum,oldLines +lineNum,newLines @@
-  // - old lines
-  // + new lines
-}
+def _find_actual_string(file_content: str, search_string: str) -> str | None:
+    if search_string in file_content:
+        return search_string
+    norm_search = _normalize_quotes(search_string)
+    norm_file = _normalize_quotes(file_content)
+    idx = norm_file.find(norm_search)
+    if idx != -1:
+        return file_content[idx:idx + len(search_string)]
+    return None
 ```
+<!-- tabs:end -->
 
-输出示例：
+关键细节：匹配成功后返回**文件中的原始字符串**而非标准化版本，替换时保持文件原始字符风格。
+
+编辑成功后生成简易 diff，行号通过计算 `old_string` 前面有几个 `\n` 得出：
+
 ```
 Successfully edited src/app.ts (matched via quote normalization)
 
@@ -264,13 +453,15 @@ Successfully edited src/app.ts (matched via quote normalization)
 + const msg = "world";
 ```
 
-#### write_file — 写文件
+#### write_file
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 function writeFile(input: { file_path: string; content: string }): string {
   try {
     const dir = dirname(input.file_path);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });  // 自动创建目录
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(input.file_path, input.content);
     return `Successfully wrote to ${input.file_path}`;
   } catch (e: any) {
@@ -278,11 +469,29 @@ function writeFile(input: { file_path: string; content: string }): string {
   }
 }
 ```
+#### **Python**
+```python
+def _write_file(inp: dict) -> str:
+    try:
+        path = Path(inp["file_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(inp["content"])
+        lines = inp["content"].split("\n")
+        line_count = len(lines)
+        preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))
+        trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
+        return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+```
+<!-- tabs:end -->
 
-System Prompt 里我们告诉 LLM"优先用 edit_file，只对新文件用 write_file"——这和 Claude Code 的策略一致。
+自动创建父目录（`mkdir -p` 效果）避免模型还得额外调用 shell 命令。System Prompt 里告诉 LLM 优先用 `edit_file`，只对新文件用 `write_file`。
 
-#### grep_search — 搜索
+#### grep_search
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 function grepSearch(input: {
   pattern: string;
@@ -308,11 +517,43 @@ function grepSearch(input: {
   }
 }
 ```
+#### **Python**
+```python
+def _grep_search(inp: dict) -> str:
+    pattern = inp["pattern"]
+    path = inp.get("path") or "."
+    include = inp.get("include")
 
-Claude Code 使用 ripgrep (`rg`)，我们用系统自带的 `grep` —— 功能够用，少一个依赖。
+    try:
+        args = ["grep", "--line-number", "--color=never", "-r"]
+        if include:
+            args.append(f"--include={include}")
+        args.extend(["--", pattern, path])
+        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        if result.returncode == 1:
+            return "No matches found."
+        if result.returncode != 0:
+            return f"Error: {result.stderr}"
+        lines = [l for l in result.stdout.split("\n") if l]
+        output = "\n".join(lines[:100])
+        if len(lines) > 100:
+            output += f"\n... and {len(lines) - 100} more matches"
+        return output
+    except Exception as e:
+        return f"Error: {e}"
+```
+<!-- tabs:end -->
 
-#### run_shell — Shell 命令
+`--color=never` 禁用 ANSI 颜色代码（输出给模型看的，不需要颜色）。Python 版本的 `--` 分隔符确保以 `-` 开头的 pattern 不被误解析为 grep 选项。
 
+grep 退出码 1 表示"无匹配"不是错误，2+ 才是真正错误，需要分别处理。结果截断为前 100 条，附加 `... and N more matches` 提示。
+
+Claude Code 用 ripgrep (`rg`)，我们用系统 `grep`——功能够用，少一个依赖。
+
+#### run_shell
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 function runShell(input: { command: string; timeout?: number }): string {
   try {
@@ -330,11 +571,38 @@ function runShell(input: { command: string; timeout?: number }): string {
   }
 }
 ```
+#### **Python**
+```python
+def _run_shell(inp: dict) -> str:
+    try:
+        timeout = inp.get("timeout", 30)
+        result = subprocess.run(
+            inp["command"],
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
+            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
+            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
+        return result.stdout or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {inp.get('timeout', 30)}s"
+    except Exception as e:
+        return f"Error: {e}"
+```
+<!-- tabs:end -->
 
-Claude Code 的 `BashTool` 有一整套安全机制（AST 解析命令、沙箱执行），我们只做了基础的 timeout 保护和危险命令检测（详见第 5 章）。
+失败时同时返回 stdout 和 stderr——很多编译器在 stderr 输出错误的同时，stdout 可能有有用的部分输出。`"(no output)"` 避免模型在命令成功但无输出时（`mkdir`、`touch`）产生困惑。
 
-### 工具结果截断：第一道防线
+Claude Code 的 BashTool 分布在 18 个源文件中，有 AST 解析命令、沙箱执行、23 个安全检查。我们只做 timeout 保护（安全机制在第 5 章详述）。
 
+### 工具结果截断
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 const MAX_RESULT_CHARS = 50000;
 
@@ -348,22 +616,34 @@ function truncateResult(result: string): string {
   );
 }
 ```
+#### **Python**
+```python
+MAX_RESULT_CHARS = 50000
 
-为什么保留头尾而不只保留头部？因为很多命令的关键输出在末尾（比如编译错误、测试结果摘要）。
+def _truncate_result(result: str) -> str:
+    if len(result) <= MAX_RESULT_CHARS:
+        return result
+    keep_each = (MAX_RESULT_CHARS - 60) // 2
+    return (
+        result[:keep_each]
+        + f"\n\n[... truncated {len(result) - keep_each * 2} chars ...]\n\n"
+        + result[-keep_each:]
+    )
+```
+<!-- tabs:end -->
+
+保留头尾而非只保留头部，因为很多命令的关键输出在末尾（编译错误摘要、测试结果统计）。截断提示明确告知模型内容被截断，模型可据此决定是否用 `grep_search` 或 `read_file` 获取完整内容。
 
 ## 简化对比
 
 | 维度 | Claude Code | mini-claude |
 |------|------------|-------------|
 | **工具数量** | 66+ | 10（6 核心 + skill + agent + 2 plan mode） |
-| **工具定义** | 每个是一个 class，有 4 个方法 | 静态 JSON schema 数组 |
-| **工具分发** | 注册表 + 依赖注入 | switch 语句 |
-| **执行模式** | StreamingToolExecutor 并发 | 串行 for 循环 |
+| **执行模式** | 并发执行多个工具调用 | 串行逐个执行 |
 | **搜索引擎** | ripgrep（rg） | 系统 grep |
 | **编辑验证** | 14 步流水线 | 引号容错 + 唯一性 + diff 输出 |
 | **Shell 安全** | AST 解析 + 沙箱 | 正则匹配 + 确认 |
 | **结果截断** | 选择性裁剪 | 保留头尾 50K |
-| **代码量** | ~10000 行（所有工具） | ~667 行 |
 
 ---
 

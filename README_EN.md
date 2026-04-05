@@ -93,6 +93,8 @@ npm start -- --model gpt-4o                      # CLI flag (higher priority)
 
 ### Run
 
+**TypeScript**
+
 ```bash
 npm start                    # Interactive REPL mode (recommended)
 npm start -- --resume        # Resume last session
@@ -104,12 +106,36 @@ npm start -- --max-cost 0.50 # Cost limit (USD)
 npm start -- --max-turns 20  # Turn limit
 ```
 
+**Python**
+
+```bash
+mini-claude-py               # Interactive REPL mode (recommended)
+mini-claude-py --resume      # Resume last session
+mini-claude-py --yolo        # Skip safety confirmations
+mini-claude-py --plan        # Plan mode: analyze only, no modifications
+mini-claude-py --accept-edits # Auto-approve file edits
+mini-claude-py --dont-ask    # CI mode: auto-deny confirmable actions
+mini-claude-py --max-cost 0.50 # Cost limit (USD)
+mini-claude-py --max-turns 20  # Turn limit
+```
+
 Install globally to use from any directory:
+
+**TypeScript**
 
 ```bash
 npm link                     # Global install
 cd ~/your-project
 mini-claude                  # Launch directly
+```
+
+**Python**
+
+```bash
+cd python
+pip install -e .             # Global install (editable mode)
+cd ~/your-project
+mini-claude-py               # Launch directly
 ```
 
 ### REPL Commands

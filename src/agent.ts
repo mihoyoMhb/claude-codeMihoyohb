@@ -173,9 +173,16 @@ export class Agent {
   private prePlanMode: PermissionMode | null = null;
   private planFilePath: string | null = null;
   private baseSystemPrompt: string = "";
+  private contextCleared: boolean = false; // Set when plan approval clears context
 
   // External confirmation callback (avoids creating a second readline on stdin)
   private confirmFn?: (message: string) => Promise<boolean>;
+
+  // Plan approval callback: returns { choice, feedback? }
+  private planApprovalFn?: (planContent: string) => Promise<{
+    choice: "clear-and-execute" | "execute" | "manual-execute" | "keep-planning";
+    feedback?: string;
+  }>;
 
   // Sub-agent output buffer (captures text instead of printing)
   private outputBuffer: string[] | null = null;
@@ -241,6 +248,13 @@ export class Agent {
 
   setConfirmFn(fn: (message: string) => Promise<boolean>) {
     this.confirmFn = fn;
+  }
+
+  setPlanApprovalFn(fn: (planContent: string) => Promise<{
+    choice: "clear-and-execute" | "execute" | "manual-execute" | "keep-planning";
+    feedback?: string;
+  }>) {
+    this.planApprovalFn = fn;
   }
 
   /** Toggle plan mode from the REPL. Returns the new mode description. */
@@ -662,7 +676,7 @@ export class Agent {
     name: string,
     input: Record<string, any>
   ): Promise<string> {
-    if (name === "enter_plan_mode" || name === "exit_plan_mode") return this.executePlanModeTool(name);
+    if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
     if (name === "agent") return this.executeAgentTool(input);
     if (name === "skill") return this.executeSkillTool(input);
     return executeTool(name, input);
@@ -737,7 +751,7 @@ Write your plan incrementally to this file using write_file or edit_file. This i
 IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that.`;
   }
 
-  private executePlanModeTool(name: string): string {
+  private async executePlanModeTool(name: string): Promise<string> {
     if (name === "enter_plan_mode") {
       if (this.permissionMode === "plan") {
         return "Already in plan mode.";
@@ -762,7 +776,51 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       if (this.planFilePath && existsSync(this.planFilePath)) {
         planContent = readFileSync(this.planFilePath, "utf-8");
       }
-      // Restore previous mode
+
+      // Interactive approval flow
+      if (this.planApprovalFn) {
+        const result = await this.planApprovalFn(planContent);
+
+        if (result.choice === "keep-planning") {
+          // User rejected — stay in plan mode, return feedback to model
+          const feedback = result.feedback || "Please revise the plan.";
+          return `User rejected the plan and wants to keep planning.\n\nUser feedback: ${feedback}\n\nPlease revise your plan based on this feedback. When done, call exit_plan_mode again.`;
+        }
+
+        // User approved — determine the target mode
+        let targetMode: PermissionMode;
+        if (result.choice === "clear-and-execute") {
+          targetMode = "acceptEdits";
+        } else if (result.choice === "execute") {
+          targetMode = "acceptEdits";
+        } else {
+          // manual-execute
+          targetMode = this.prePlanMode || "default";
+        }
+
+        // Exit plan mode
+        this.permissionMode = targetMode;
+        this.prePlanMode = null;
+        const savedPlanPath = this.planFilePath;
+        this.planFilePath = null;
+        this.systemPrompt = this.baseSystemPrompt;
+        if (this.useOpenAI && this.openaiMessages.length > 0) {
+          (this.openaiMessages[0] as any).content = this.systemPrompt;
+        }
+
+        // Clear context if requested
+        if (result.choice === "clear-and-execute") {
+          this.clearHistoryKeepSystem();
+          this.contextCleared = true; // Signal the agent loop to inject plan as user message
+          printInfo(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
+          return `User approved the plan. Context was cleared. Permission mode: ${targetMode}\n\nPlan file: ${savedPlanPath}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
+        }
+
+        printInfo(`Plan approved. Executing in ${targetMode} mode.`);
+        return `User approved the plan. Permission mode: ${targetMode}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
+      }
+
+      // Fallback: no approval function, just exit directly (e.g. sub-agents)
       this.permissionMode = this.prePlanMode || "default";
       this.prePlanMode = null;
       this.planFilePath = null;
@@ -775,6 +833,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     }
 
     return `Unknown plan mode tool: ${name}`;
+  }
+
+  /** Clear history but keep system prompt intact (used for clear-context plan approval) */
+  private clearHistoryKeepSystem() {
+    this.anthropicMessages = [];
+    this.openaiMessages = [];
+    if (this.useOpenAI) {
+      this.openaiMessages.push({ role: "system", content: this.systemPrompt });
+    }
+    this.lastInputTokenCount = 0;
   }
 
   private async executeAgentTool(input: Record<string, any>): Promise<string> {
@@ -890,6 +958,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         const result = await this.executeToolCall(toolUse.name, input);
         printToolResult(toolUse.name, result);
+
+        // If context was cleared (plan approval with clear), inject as user message instead
+        if (this.contextCleared) {
+          this.contextCleared = false;
+          this.anthropicMessages.push({ role: "user", content: result });
+          break; // Skip remaining tool results, start fresh
+        }
+
         toolResults.push({
           type: "tool_result",
           tool_use_id: toolUse.id,
@@ -897,7 +973,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         });
       }
 
-      this.anthropicMessages.push({ role: "user", content: toolResults });
+      if (!this.contextCleared && toolResults.length > 0) {
+        this.anthropicMessages.push({ role: "user", content: toolResults });
+      }
+      this.contextCleared = false;
       await this.checkAndCompact();
     }
   }
@@ -1047,6 +1126,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         const result = await this.executeToolCall(fnName, input);
         printToolResult(fnName, result);
 
+        // If context was cleared (plan approval with clear), inject as user message
+        if (this.contextCleared) {
+          this.contextCleared = false;
+          this.openaiMessages.push({ role: "user", content: result });
+          break;
+        }
+
         this.openaiMessages.push({
           role: "tool",
           tool_call_id: tc.id,
@@ -1054,6 +1140,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         });
       }
 
+      this.contextCleared = false;
       await this.checkAndCompact();
     }
   }

@@ -1,52 +1,21 @@
-import { readFileSync, existsSync } from "fs";
-import { join, resolve } from "path";
-import { execSync } from "child_process";
-import * as os from "os";
-import { buildMemoryPromptSection } from "./memory.js";
-import { buildSkillDescriptions } from "./skills.js";
-import { buildAgentDescriptions } from "./subagent.js";
+"""System prompt construction — template embedded, variable interpolation, context gathering."""
 
-// ─── CLAUDE.md loader ────────────────────────────────────────
+from __future__ import annotations
 
-export function loadClaudeMd(): string {
-  const parts: string[] = [];
-  let dir = process.cwd();
-  while (true) {
-    const file = join(dir, "CLAUDE.md");
-    if (existsSync(file)) {
-      try {
-        parts.unshift(readFileSync(file, "utf-8"));
-      } catch {}
-    }
-    const parent = resolve(dir, "..");
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return parts.length > 0
-    ? "\n\n# Project Instructions (CLAUDE.md)\n" + parts.join("\n\n---\n\n")
-    : "";
-}
+import os
+import platform
+import subprocess
+import sys
+from pathlib import Path
 
-// ─── Git context ─────────────────────────────────────────────
+from .memory import build_memory_prompt_section
+from .skills import build_skill_descriptions
+from .subagent import build_agent_descriptions
 
-export function getGitContext(): string {
-  try {
-    const opts = { encoding: "utf-8" as const, timeout: 3000, stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"] };
-    const branch = execSync("git rev-parse --abbrev-ref HEAD", opts).trim();
-    const log = execSync("git log --oneline -5", opts).trim();
-    const status = execSync("git status --short", opts).trim();
-    let result = `\nGit branch: ${branch}`;
-    if (log) result += `\nRecent commits:\n${log}`;
-    if (status) result += `\nGit status:\n${status}`;
-    return result;
-  } catch {
-    return "";
-  }
-}
+# ─── System prompt template (embedded) ──────────────────────
 
-// ─── System prompt template (embedded) ──────────────────────
-
-const SYSTEM_PROMPT_TEMPLATE = `You are Mini Claude Code, a lightweight coding assistant CLI.
+SYSTEM_PROMPT_TEMPLATE = """\
+You are Mini Claude Code, a lightweight coding assistant CLI.
 You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
 
 IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
@@ -95,7 +64,7 @@ When you encounter an obstacle, do not use destructive actions as a shortcut to 
    - To search the content of files, use grep_search instead of grep or rg
    - Reserve using the run_shell exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the run_shell tool for these if it is absolutely necessary.
  - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead.
- - Use the \`agent\` tool with specialized agents when the task at hand matches the agent's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but they should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing - if you delegate research to a subagent, do not also perform the same searches yourself.
+ - Use the `agent` tool with specialized agents when the task at hand matches the agent's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but they should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing - if you delegate research to a subagent, do not also perform the same searches yourself.
 
 # Tone and style
  - Only use emojis if the user explicitly requests it. Avoid using emojis in all communication unless asked.
@@ -125,30 +94,70 @@ Shell: {{shell}}
 {{claude_md}}
 {{memory}}
 {{skills}}
-{{agents}}`;
+{{agents}}"""
 
-// ─── System prompt builder ───────────────────────────────────
 
-export function buildSystemPrompt(): string {
-  const date = new Date().toISOString().split("T")[0];
-  const platform = `${os.platform()} ${os.arch()}`;
-  const shell = process.platform === "win32"
-    ? (process.env.ComSpec || "cmd.exe")
-    : (process.env.SHELL || "/bin/sh");
-  const gitContext = getGitContext();
-  const claudeMd = loadClaudeMd();
-  const memorySection = buildMemoryPromptSection();
-  const skillsSection = buildSkillDescriptions();
-  const agentSection = buildAgentDescriptions();
+def load_claude_md() -> str:
+    """Walk up from cwd collecting all CLAUDE.md files."""
+    parts: list[str] = []
+    d = Path.cwd().resolve()
+    while True:
+        f = d / "CLAUDE.md"
+        if f.is_file():
+            try:
+                parts.insert(0, f.read_text())
+            except Exception:
+                pass
+        parent = d.parent
+        if parent == d:
+            break
+        d = parent
+    if parts:
+        return "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
+    return ""
 
-  return SYSTEM_PROMPT_TEMPLATE
-    .split("{{cwd}}").join(process.cwd())
-    .split("{{date}}").join(date)
-    .split("{{platform}}").join(platform)
-    .split("{{shell}}").join(shell)
-    .split("{{git_context}}").join(gitContext)
-    .split("{{claude_md}}").join(claudeMd)
-    .split("{{memory}}").join(memorySection)
-    .split("{{skills}}").join(skillsSection)
-    .split("{{agents}}").join(agentSection);
-}
+
+def get_git_context() -> str:
+    """Get git branch, recent commits, and status."""
+    try:
+        opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True}
+        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **opts).stdout.strip()
+        log = subprocess.run(["git", "log", "--oneline", "-5"], **opts).stdout.strip()
+        status = subprocess.run(["git", "status", "--short"], **opts).stdout.strip()
+        result = f"\nGit branch: {branch}"
+        if log:
+            result += f"\nRecent commits:\n{log}"
+        if status:
+            result += f"\nGit status:\n{status}"
+        return result
+    except Exception:
+        return ""
+
+
+def build_system_prompt() -> str:
+    """Build the full system prompt from embedded template + dynamic context."""
+    from datetime import date
+    today = date.today().isoformat()
+    plat = f"{platform.system()} {platform.machine()}"
+    shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
+    git_context = get_git_context()
+    claude_md = load_claude_md()
+    memory_section = build_memory_prompt_section()
+    skills_section = build_skill_descriptions()
+    agent_section = build_agent_descriptions()
+
+    replacements = {
+        "{{cwd}}": str(Path.cwd()),
+        "{{date}}": today,
+        "{{platform}}": plat,
+        "{{shell}}": shell,
+        "{{git_context}}": git_context,
+        "{{claude_md}}": claude_md,
+        "{{memory}}": memory_section,
+        "{{skills}}": skills_section,
+        "{{agents}}": agent_section,
+    }
+    result = SYSTEM_PROMPT_TEMPLATE
+    for key, value in replacements.items():
+        result = result.replace(key, value)
+    return result

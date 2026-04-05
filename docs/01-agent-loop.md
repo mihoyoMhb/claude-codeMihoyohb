@@ -21,88 +21,98 @@ graph TB
 
 ## Claude Code 怎么做的
 
-Claude Code 的 Agent Loop 分布在两层架构中：
+### 双层架构
 
-### QueryEngine（会话级） — `src/QueryEngine.ts`
+Claude Code 把 Agent Loop 拆成两层：
 
-QueryEngine 管理整个会话的生命周期，持有消息历史、工具列表、token 统计等状态。它提供 `query()` 方法发起一轮对话。
+- **QueryEngine**（~1155 行）：会话级，管整个对话生命周期——用户输入处理、USD 预算检查、Token 统计、会话恢复
+- **queryLoop**（~1728 行）：单轮级，管一次查询的执行——消息压缩、API 调用、工具执行、错误恢复
 
-### queryLoop（单轮级） — `src/query.ts:241`
+这样拆的好处是关注点分离：QueryEngine 不需要知道"PTL 错误怎么恢复"，queryLoop 不需要知道"用户输入怎么解析"。
 
-`queryLoop` 是一个 **async generator**，每次 yield 一个事件（文本块、工具调用、工具结果等）。它处理 7 种 continue reason：
+### queryLoop：异步生成器
 
-```typescript
-// Claude Code 的 queryLoop 简化逻辑
-async function* queryLoop(params) {
-  while (true) {
-    const response = yield* streamResponse(params);
+queryLoop 签名是 `async function*`——异步生成器。选这个而不是回调/事件的原因：
 
-    // 7 种 continue reason 决定是否继续循环
-    if (response.stopReason === "end_turn") break;
-    if (response.stopReason === "tool_use") {
-      const results = yield* executeTools(response.toolUses);
-      params.messages.push(...results);
-      continue;
-    }
-    if (response.stopReason === "max_tokens") {
-      // 自动继续生成
-      continue;
-    }
-    // ... 还有 stop_sequence, content_filter 等
-  }
-}
+1. **背压控制**：消费端不处理完，生产端不继续，天然防止事件堆积
+2. **线性控制流**：所有循环分支用普通 `continue` / `break` 表达，不需要状态机
+
+### 七种 Continue Reason
+
+循环有 7 个继续位置，对应 7 种不同场景：
+
+| # | 名称 | 触发场景 | 处理策略 |
+|---|------|---------|---------|
+| 1 | `next_turn` | 模型调用了工具 | 执行工具，结果推入消息，继续 |
+| 2 | `collapse_drain_retry` | PTL 错误，有暂存的折叠操作 | 提交折叠释放空间，重试 |
+| 3 | `reactive_compact_retry` | PTL 错误，折叠空间不够 | 强制全量摘要压缩，重试 |
+| 4 | `max_output_tokens_escalate` | 输出 Token 截断，首次 | 升级到更高 Token 限制（16K→64K），重试 |
+| 5 | `max_output_tokens_recovery` | 输出 Token 截断，升级不可用 | 注入续写提示，最多重试 3 次 |
+| 6 | `stop_hook_blocking` | 任务完成但 Stop Hook 拦截 | 继续执行循环 |
+| 7 | `token_budget_continuation` | API 侧 Token 预算耗尽 | 继续生成 |
+
+我们的简化实现只处理第 1 种：有 tool_use 就继续，否则停。
+
+### 错误扣留策略
+
+这是个值得单独说的设计：**可恢复的错误不立即暴露给上层**。
+
+当输出 Token 被截断时，如果直接 yield 错误给 QueryEngine，UI 会显示报错——但 queryLoop 后续的恢复逻辑其实能自动处理这个问题。所以 Claude Code 的做法是先"扣留"错误，执行恢复逻辑，成功了用户完全无感知，失败了才最终暴露。大多数 `max_output_tokens` 和 `prompt_too_long` 错误都被这样静默处理掉了。
+
+### 并行工具执行
+
+Claude Code 用 `StreamingToolExecutor` 在 API 流式响应期间并行执行工具：
+
+```
+串行（我们的实现）：
+  [========= API 流式响应 =========][tool1][tool2][tool3]
+
+并行（Claude Code）：
+  [========= API 流式响应 =========]
+       ↑ tool1 的 JSON 完成 → 立即执行
+            ↑ tool2 的 JSON 完成 → 立即执行
 ```
 
-关键设计：
-
-- **State 对象**在迭代间传递，包含 `messages`、`tools`、`abortController` 等
-- **事件系统**：通过 yield 向上层传递各种事件，UI 层订阅渲染
-- **StreamingToolExecutor**：并发执行多个工具调用，按原始顺序返回结果
+一个典型 API 响应有 5-30 秒的流式窗口，在这个时间里多个工具可以并发完成。
 
 ## 我们的实现
 
-我们把两层架构合并成一个 `Agent` 类，核心是 `chatAnthropic()` 方法：
+把双层架构合并成一个 `Agent` 类，核心是 `chatAnthropic()` 方法：
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 // agent.ts — chatAnthropic 方法（核心 Agent Loop）
 
 private async chatAnthropic(userMessage: string): Promise<void> {
-  // 1. 用户消息推入历史
   this.anthropicMessages.push({ role: "user", content: userMessage });
 
   while (true) {
-    // 中断检查
     if (this.abortController?.signal.aborted) break;
 
-    // 2. 调用 API（带流式输出）
     const response = await this.callAnthropicStream();
 
-    // 3. 统计 token 用量
+    // 累计 token 用量
     this.totalInputTokens += response.usage.input_tokens;
     this.totalOutputTokens += response.usage.output_tokens;
     this.lastInputTokenCount = response.usage.input_tokens;
 
-    // 4. 提取所有 tool_use block
+    // 提取 tool_use block
     const toolUses: Anthropic.ToolUseBlock[] = [];
     for (const block of response.content) {
-      if (block.type === "tool_use") {
-        toolUses.push(block);
-      }
+      if (block.type === "tool_use") toolUses.push(block);
     }
 
-    // 5. 整个 assistant 响应推入历史
-    this.anthropicMessages.push({
-      role: "assistant",
-      content: response.content,
-    });
+    // assistant 响应推入历史
+    this.anthropicMessages.push({ role: "assistant", content: response.content });
 
-    // 6. 终止条件：没有工具调用 → 任务完成
+    // 没有工具调用 → 任务完成
     if (toolUses.length === 0) {
       printCost(this.totalInputTokens, this.totalOutputTokens);
-      break;  // ← 这就是循环的出口
+      break;
     }
 
-    // 7. 执行每个工具调用
+    // 串行执行每个工具
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
     for (const toolUse of toolUses) {
       if (this.abortController?.signal.aborted) break;
@@ -110,135 +120,166 @@ private async chatAnthropic(userMessage: string): Promise<void> {
       const input = toolUse.input as Record<string, any>;
       printToolCall(toolUse.name, input);
 
-      // 权限检查（详见第 5 章，5 种权限模式）
-      const confirmMsg = needsConfirmation(toolUse.name, input, this.permissionMode);
-      if (confirmMsg && !this.confirmedPaths.has(confirmMsg)) {
-        const confirmed = await this.confirmDangerous(confirmMsg);
+      // 权限检查（详见第 5 章）
+      const perm = checkPermission(toolUse.name, input, this.permissionMode, this.planFilePath);
+      if (perm.action === "deny") {
+        toolResults.push({ type: "tool_result", tool_use_id: toolUse.id,
+          content: `Action denied: ${perm.message}` });
+        continue;
+      }
+      if (perm.action === "confirm" && perm.message && !this.confirmedPaths.has(perm.message)) {
+        const confirmed = await this.confirmDangerous(perm.message);
         if (!confirmed) {
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: toolUse.id,
-            content: "User denied this action.",
-          });
-          continue;  // 跳过被拒绝的工具
+          toolResults.push({ type: "tool_result", tool_use_id: toolUse.id,
+            content: "User denied this action." });
+          continue;
         }
-        this.confirmedPaths.add(confirmMsg);
+        this.confirmedPaths.add(perm.message);
       }
 
-      // 执行工具并收集结果
       const result = await executeTool(toolUse.name, input);
       printToolResult(toolUse.name, result);
-      toolResults.push({
-        type: "tool_result",
-        tool_use_id: toolUse.id,
-        content: result,
-      });
+      toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: result });
     }
 
-    // 8. 工具结果作为 user 消息推入（Anthropic API 要求）
+    // 工具结果以 user 消息推入（Anthropic API 要求）
     this.anthropicMessages.push({ role: "user", content: toolResults });
 
-    // 9. 检查是否需要压缩上下文（详见第 6 章）
+    // 上下文压缩检查（详见第 6 章）
     await this.checkAndCompact();
   }
-  // 循环结束 → 回到 chat()，打印分隔线，自动保存会话
 }
 ```
+#### **Python**
+```python
+# agent.py — _chat_anthropic 方法（核心 Agent Loop）
 
-### 消息流转的关键
+async def _chat_anthropic(self, user_message: str) -> None:
+    self._anthropic_messages.append({"role": "user", "content": user_message})
 
-理解 Agent Loop 的关键在于理解**消息数组是如何增长的**：
+    while True:
+        if self._aborted:
+            break
+
+        self._run_compression_pipeline()
+        response = await self._call_anthropic_stream()
+
+        self.total_input_tokens += response.usage.input_tokens
+        self.total_output_tokens += response.usage.output_tokens
+        self.last_input_token_count = response.usage.input_tokens
+
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
+
+        self._anthropic_messages.append({
+            "role": "assistant",
+            "content": [self._block_to_dict(b) for b in response.content],
+        })
+
+        if not tool_uses:
+            if not self.is_sub_agent:
+                print_cost(self.total_input_tokens, self.total_output_tokens)
+            break
+
+        tool_results = []
+        for tu in tool_uses:
+            if self._aborted:
+                break
+            inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
+            print_tool_call(tu.name, inp)
+
+            # 权限检查（详见第 5 章）
+            perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
+            if perm["action"] == "deny":
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                     "content": f"Action denied: {perm.get('message', '')}"})
+                continue
+            if perm["action"] == "confirm" and perm.get("message") \
+               and perm["message"] not in self._confirmed_paths:
+                confirmed = await self._confirm_dangerous(perm["message"])
+                if not confirmed:
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                         "content": "User denied this action."})
+                    continue
+                self._confirmed_paths.add(perm["message"])
+
+            result = await self._execute_tool_call(tu.name, inp)
+            print_tool_result(tu.name, result)
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
+
+        self._anthropic_messages.append({"role": "user", "content": tool_results})
+        await self._check_and_compact()
+```
+<!-- tabs:end -->
+
+### 消息数组的增长方式
+
+理解 Agent Loop 的关键：消息数组是怎么增长的。
 
 ```
-初始状态:
-  messages = []
-
 第 1 轮:
   messages = [
-    { role: "user", content: "帮我修复 bug" },                    ← 用户输入
-    { role: "assistant", content: [text + tool_use(read_file)] },  ← LLM 响应
-    { role: "user", content: [tool_result("文件内容...")] },       ← 工具结果
+    { role: "user",      content: "帮我修复 bug" }
+    { role: "assistant", content: [text + tool_use(read_file)] }
+    { role: "user",      content: [tool_result("文件内容...")] }
   ]
 
 第 2 轮（LLM 看到文件内容后决定编辑）:
   messages = [
     ...前 3 条,
-    { role: "assistant", content: [text + tool_use(edit_file)] },  ← LLM 再次响应
-    { role: "user", content: [tool_result("编辑成功")] },          ← 工具结果
+    { role: "assistant", content: [text + tool_use(edit_file)] }
+    { role: "user",      content: [tool_result("编辑成功")] }
   ]
 
 第 3 轮（LLM 认为任务完成）:
   messages = [
     ...前 5 条,
-    { role: "assistant", content: [text("已修复!")] },             ← 纯文本，无 tool_use
+    { role: "assistant", content: [text("已修复!")] }  ← 无 tool_use → break
   ]
-  → toolUses.length === 0 → break!
 ```
+
+每轮循环消息数组增长两条：一条 assistant，一条 user（工具结果）。模型每次都能看到完整历史，这是它能"记住"之前做过什么的原因。工具结果用 `role: "user"` 推入是 Anthropic API 的协议要求，结果必须通过 `tool_use_id` 关联回对应的调用。
 
 ### AbortController：优雅中断
 
-Agent 通过 `AbortController` 支持 Ctrl+C 中断：
-
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// chat() 入口设置 AbortController
 async chat(userMessage: string): Promise<void> {
   this.abortController = new AbortController();
   try {
     await this.chatAnthropic(userMessage);
   } finally {
-    this.abortController = null;  // 重置，标记处理完成
+    this.abortController = null;
   }
+  printDivider();
+  this.autoSave();
 }
 
-// 外部调用 abort()
 abort() {
   this.abortController?.abort();
 }
-
-// 循环内检查中断信号
-while (true) {
-  if (this.abortController?.signal.aborted) break;
-  // ...
-}
 ```
+#### **Python**
+```python
+async def chat(self, user_message: str) -> None:
+    self._aborted = False
+    try:
+        if self.use_openai:
+            await self._chat_openai(user_message)
+        else:
+            await self._chat_anthropic(user_message)
+    finally:
+        pass
+    if not self.is_sub_agent:
+        print_divider()
+        self._auto_save()
 
-`signal` 同时传递给 API 调用，确保网络请求也能被中断。
-
-### chat() 入口方法
-
-`chat()` 是外部调用的唯一入口，它做三件事：
-
-```typescript
-async chat(userMessage: string): Promise<void> {
-  this.abortController = new AbortController();
-  try {
-    if (this.useOpenAI) {
-      await this.chatOpenAI(userMessage);    // OpenAI 兼容后端
-    } else {
-      await this.chatAnthropic(userMessage); // Anthropic 原生后端
-    }
-  } finally {
-    this.abortController = null;
-  }
-  printDivider();    // 打印分隔线
-  this.autoSave();   // 自动保存会话
-}
+def abort(self) -> None:
+    self._aborted = True
 ```
+<!-- tabs:end -->
 
-## 简化对比
-
-| 维度 | Claude Code | mini-claude |
-|------|------------|-------------|
-| **循环结构** | async generator（yield 事件） | 简单 while(true) 循环 |
-| **架构层次** | QueryEngine + queryLoop 两层 | 单个 Agent 类 |
-| **Continue Reason** | 7 种（tool_use, max_tokens, end_turn...） | 只检查 tool_use |
-| **状态管理** | State 对象在函数间传递 | class 成员变量 |
-| **事件系统** | yield 事件 → UI 订阅 | 直接 `console` 输出 |
-| **工具执行** | StreamingToolExecutor 并发 | 串行 for 循环 |
-| **中断支持** | AbortController + 事件 | AbortController（相同） |
-| **代码量** | ~2000 行（query.ts + QueryEngine.ts） | ~70 行（chatAnthropic） |
-
-最关键的简化是**把 async generator 换成 while 循环**。Claude Code 使用 generator 是为了把循环内部的每一步都作为事件 yield 出去，供 React/Ink UI 订阅渲染。我们直接在循环里 `console.log`，不需要这层抽象。
+`AbortController` 是标准的中断机制：`abort()` 被调用后 signal 变为 `aborted`，循环在下一个检查点退出。signal 同时传给 API 调用，确保网络请求也能被取消。
 
 ---
 

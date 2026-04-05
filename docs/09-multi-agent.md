@@ -30,112 +30,72 @@ graph TB
 
 ## Claude Code 怎么做的
 
-Claude Code 的多 Agent 体系在 `src/tools/AgentTool/` 中实现，是一个相当复杂的系统。
+Claude Code 的多 Agent 体系在 `src/tools/AgentTool/` 中实现，支持三种协作模式：
 
-### 三种协作模型
+| 模式 | 特点 |
+|------|------|
+| **Sub-Agent**（fork-return） | 分叉独立执行，完成后返回结果 |
+| **Coordinator** | 一个协调者分配任务给多个 Worker |
+| **Swarm Team** | 多 Agent 对等协作，通过信箱通信 |
 
-Claude Code 支持三种 Agent 协作模式：
-
-| 模式 | 模型 | 特点 |
-|------|------|------|
-| **Sub-Agent**（fork-return） | 分叉独立执行，完成后返回结果 | 我们实现的模式 |
-| **Coordinator** | 一个协调者分配任务给多个 Agent | 需要任务队列 |
-| **Swarm Team** | 多 Agent 对等协作 | 需要共享状态 |
-
-其中 Sub-Agent 是最核心也是最常用的模式。
+我们实现的是 Sub-Agent 模式，也是最常用的。
 
 ### 内置 Agent 类型
 
-- **Explore**：使用 Haiku 模型（更快更便宜），只读工具集，专门用于代码搜索和探索
+- **Explore**：用 Haiku 模型（更便宜），只读工具集，专门用于代码搜索
 - **Plan**：只读 + 结构化输出，设计实现方案
 - **General**：完整工具集（除了不能递归创建子 Agent）
-- **Custom**：通过 `.claude/agents/*.md` 文件定义自定义 Agent 类型
+- **Custom**：通过 `.claude/agents/*.md` 文件定义
 
-### 5 阶段执行流程
+### Coordinator 模式的关键设计
 
-AgentTool 的执行经过 5 个阶段：
+Coordinator 将主 Agent 变为**纯编排者**——工具集被硬限制为只有 `Agent`（派生 Worker）和 `SendMessage`（续传 Worker），完全无法执行文件操作。这个硬约束防止协调器"懒得委托、自己动手"而退化成普通单 Agent。
 
-1. **类型解析**：根据 `type` 参数确定 Agent 类型（内置 or 自定义）
-2. **工具池过滤**：4 层过滤管道决定子 Agent 能用哪些工具
-3. **System Prompt 构造**：每种类型有专用的系统提示词
-4. **上下文创建**：deny-by-default，独立消息历史，可选缓存共享
-5. **执行分支**：fork 子进程或内部调用，收集结果返回主 Agent
+标准工作流分四阶段：**研究（并行只读）→ 综合（协调器串行理解）→ 实施（按文件集串行）→ 验证**。
+
+其中综合阶段有个反直觉的约束：提示词里明确禁止写 "based on your findings"。这强制协调器真正理解并具体化研究结果（包含文件路径、行号），而不是把理解工作转包给下一个 Worker。
+
+每个 Worker 都是从零开始的独立 Agent，看不到协调器与用户的对话，所以协调器写给 Worker 的 prompt 必须自包含——这是 Coordinator 模式中最容易踩坑的地方。
 
 ### 工具过滤：4 层管道
 
-Claude Code 对子 Agent 的工具访问有严格的分层过滤：
+子 Agent 的工具访问经过 4 层过滤，实现纵深防御：
 
-```
-ALL_AGENT_DISALLOWED     → 所有子 Agent 禁用的工具
-CUSTOM_AGENT_DISALLOWED  → 自定义 Agent 额外禁用的工具
-ASYNC_AGENT_ALLOWED      → 异步 Agent 特别允许的工具
-agent-specific           → 特定类型的工具白名单
-```
+1. 移除元工具（`TaskOutput`、`EnterPlanMode`、`AskUserQuestion` 等）——子 Agent 不应控制 Agent 执行流程
+2. 对自定义 Agent 额外限制——用户定义的类型不与内建类型同级信任
+3. 异步 Agent 用白名单模式——后台运行无法展示交互 UI，必须严格限制
+4. Agent 类型级 `disallowedTools`——如 Explore 显式排除写入工具
 
-这种多层过滤确保子 Agent 只能访问其职责范围内的工具，是安全性的重要保障。
+前三层是全局策略，第四层是类型策略。即使自定义 Agent 设置了 `disallowedTools: []`，前三层仍然有效。
 
 ### 上下文隔离
 
-Claude Code 的子 Agent 采用 **deny-by-default** 策略：
+子 Agent 采用 deny-by-default：消息历史完全独立，`abortController` 单向传播（父中断→子中断，反之不行），子 Agent 的状态变更默认不传播到父级 UI。只有一个例外：Bash 启动的后台进程必须注册到根 store，否则成为僵尸进程。
 
-- 子 Agent 拥有独立的消息历史，不能看到主 Agent 的对话
-- 子 Agent 的系统提示词由父 Agent 继承（优化 prompt cache 命中率）
-- 子 Agent 的 token 消耗会汇总到父 Agent 的计费中
+### Worktree 隔离
+
+多 Agent 并行写文件时，Claude Code 给每个写操作 Agent 分配独立的 Git Worktree——共享 `.git` 目录但有独立工作目录，完全无冲突，开销比 `git clone` 小得多。
 
 ## 我们的实现
 
-我们用 **~74 行** 的 `subagent.ts` + Agent 类的少量改动，实现了 Claude Code Sub-Agent 模式的核心。
+用 **~199 行** 的 `subagent.ts` + Agent 类的少量改动，实现 Sub-Agent 模式的核心。
 
-### 整体架构
-
-```mermaid
-sequenceDiagram
-    participant User as 用户
-    participant Main as 主 Agent
-    participant Tool as executeAgentTool
-    participant Config as getSubAgentConfig
-    participant Sub as 子 Agent
-
-    User->>Main: 用户请求
-    Main->>Main: LLM 返回 agent tool_use
-    Main->>Tool: name="agent", {type, prompt}
-    Tool->>Config: getSubAgentConfig(type)
-    Config-->>Tool: {systemPrompt, tools}
-    Tool->>Sub: new Agent({customPrompt, customTools, isSubAgent: true})
-    Tool->>Sub: runOnce(prompt)
-    Sub->>Sub: chat() → 完整 agent loop
-    Sub-->>Tool: {text, tokens}
-    Tool->>Main: 返回结果文本
-    Main->>Main: 汇总 token，继续主循环
-```
-
-关键简化：
-
-| Claude Code | 我们的实现 | 为什么可以简化 |
-|-------------|-----------|--------------|
+| Claude Code | 我们的实现 | 简化原因 |
+|-------------|-----------|---------|
 | 5 阶段执行流程 | 直接 new Agent + runOnce | 不需要 fork 进程、缓存共享 |
-| 4 层工具过滤管道 | 1 个 Set + filter | 只有 3 种固定类型，不需要动态规则 |
-| Haiku 模型给 Explore | 统一用主模型 | 简化配置，实际效果差别不大 |
-| 自定义 Agent（`.md` 文件） | 不支持 | 3 种内置类型覆盖主要场景 |
+| 4 层工具过滤管道 | 1 个 Set + filter | 只有 3 种固定类型 |
+| Haiku 模型给 Explore | 统一用主模型 | 减少配置复杂度 |
 | deny-by-default 上下文隔离 | 天然隔离（独立 Agent 实例） | new Agent 自带独立消息历史 |
 
 ## 关键代码
 
 ### 1. Agent 类型配置 — `subagent.ts`
 
-这是整个子 Agent 系统的配置中心，定义了 3 种 Agent 类型的行为：
-
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// subagent.ts
-
 export type SubAgentType = "explore" | "plan" | "general";
 
-export interface SubAgentConfig {
-  systemPrompt: string;
-  tools: ToolDef[];
-}
-
-// 只读工具集 — explore 和 plan 共用
 const READ_ONLY_TOOLS = new Set([
   "read_file", "list_files", "grep_search", "run_shell"
 ]);
@@ -144,9 +104,19 @@ function getReadOnlyTools(): ToolDef[] {
   return toolDefinitions.filter((t) => READ_ONLY_TOOLS.has(t.name));
 }
 ```
+#### **Python**
+```python
+READ_ONLY_TOOLS = {"read_file", "list_files", "grep_search"}
 
-为什么 `run_shell` 在"只读"工具集里？因为 shell 能执行 `git log`、`find`、`wc` 等强大的只读命令，完全禁止会大幅降低 explore 的能力。安全性通过 system prompt 中的约束来保证：
+def _get_read_only_tools() -> list[ToolDef]:
+    return [t for t in tool_definitions if t["name"] in READ_ONLY_TOOLS]
+```
+<!-- tabs:end -->
 
+为什么 `run_shell` 在"只读"工具集里？`git log`、`find`、`wc` 这类只读命令是代码探索的核心手段，完全禁止 shell 会大幅削弱 Explore 的能力。安全性通过 system prompt 约束保证：
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 const EXPLORE_PROMPT = `You are an Explore agent — a fast, READ-ONLY sub-agent...
 
@@ -155,23 +125,27 @@ IMPORTANT CONSTRAINTS:
 - If using run_shell, only use read commands (ls, cat, find, grep, git log, etc.)
 - Do NOT use write, edit, rm, mv, or any destructive shell commands.
 
-Your job:
-- Search files by patterns (list_files)
-- Search code for keywords (grep_search)
-- Read file contents (read_file)
-- Run read-only shell commands (git log, git diff, find, etc.)
-
 Be fast and thorough. Use multiple tool calls when possible.
 Return a concise summary of your findings.`;
 ```
+#### **Python**
+```python
+EXPLORE_PROMPT = """You are an Explore agent — a fast, READ-ONLY sub-agent specialized for codebase exploration.
+
+IMPORTANT CONSTRAINTS:
+- You are READ-ONLY. You only have access to read_file, list_files, and grep_search.
+- Do NOT attempt to modify any files.
+
+Be fast and thorough. Use multiple tool calls when possible. Return a concise summary of your findings."""
+```
+<!-- tabs:end -->
 
 Plan Agent 同样只读，但 prompt 引导它输出结构化方案：
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 const PLAN_PROMPT = `You are a Plan agent — a READ-ONLY sub-agent specialized for designing implementation plans.
-
-IMPORTANT CONSTRAINTS:
-- You are READ-ONLY. Do NOT modify any files.
 
 Your job:
 - Analyze the codebase to understand the current architecture
@@ -185,21 +159,41 @@ Return a structured plan with:
 3. Critical files for implementation
 4. Potential risks or considerations`;
 ```
+#### **Python**
+```python
+PLAN_PROMPT = """You are a Plan agent — a READ-ONLY sub-agent specialized for designing implementation plans.
 
-General Agent 最简单 — 拿到除 `agent` 外的全部工具：
+Return a structured plan with:
+1. Summary of current state
+2. Step-by-step implementation steps
+3. Critical files for implementation
+4. Potential risks or considerations"""
+```
+<!-- tabs:end -->
 
+General Agent 拿到除 `agent` 外的全部工具：
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 const GENERAL_PROMPT = `You are a General sub-agent handling an independent task.
 Complete the assigned task and return a concise result. You have access to all tools.`;
 
 export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
+  // 先查自定义 Agent
+  const custom = discoverCustomAgents().get(type);
+  if (custom) {
+    const tools = custom.allowedTools
+      ? toolDefinitions.filter(t => custom.allowedTools!.includes(t.name))
+      : toolDefinitions.filter(t => t.name !== "agent");
+    return { systemPrompt: custom.systemPrompt, tools };
+  }
   switch (type) {
     case "explore":
       return { systemPrompt: EXPLORE_PROMPT, tools: getReadOnlyTools() };
     case "plan":
       return { systemPrompt: PLAN_PROMPT, tools: getReadOnlyTools() };
     case "general":
-      // General agents get all tools except 'agent' (no recursive sub-agents)
       return {
         systemPrompt: GENERAL_PROMPT,
         tools: toolDefinitions.filter((t) => t.name !== "agent"),
@@ -207,14 +201,36 @@ export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
   }
 }
 ```
+#### **Python**
+```python
+GENERAL_PROMPT = "You are a General sub-agent handling an independent task. Complete the assigned task and return a concise result. You have access to all tools."
+
+def get_sub_agent_config(agent_type: str) -> dict:
+    custom = _discover_custom_agents().get(agent_type)
+    if custom:
+        if custom["allowed_tools"]:
+            tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
+        else:
+            tools = [t for t in tool_definitions if t["name"] != "agent"]
+        return {"system_prompt": custom["system_prompt"], "tools": tools}
+
+    read_only = [t for t in tool_definitions if t["name"] in READ_ONLY_TOOLS]
+    if agent_type == "explore":
+        return {"system_prompt": EXPLORE_PROMPT, "tools": read_only}
+    elif agent_type == "plan":
+        return {"system_prompt": PLAN_PROMPT, "tools": read_only}
+    else:
+        return {"system_prompt": GENERAL_PROMPT, "tools": [t for t in tool_definitions if t["name"] != "agent"]}
+```
+<!-- tabs:end -->
 
 ### 2. Agent 工具定义 — `tools.ts`
 
-`agent` 作为一个普通工具注册，与 `read_file`、`run_shell` 等并列：
+`agent` 作为一个普通工具注册，`type` 不是 required——LLM 不确定时可以省略，默认回退到 `general`：
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// tools.ts — agent 工具定义
-
 {
   name: "agent",
   description:
@@ -224,101 +240,155 @@ export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
   input_schema: {
     type: "object",
     properties: {
-      description: {
-        type: "string",
-        description: "Short (3-5 word) description of the sub-agent's task",
-      },
-      prompt: {
-        type: "string",
-        description: "Detailed task instructions for the sub-agent",
-      },
+      description: { type: "string", description: "Short (3-5 word) description of the sub-agent's task" },
+      prompt: { type: "string", description: "Detailed task instructions for the sub-agent" },
       type: {
         type: "string",
         enum: ["explore", "plan", "general"],
-        description: "Agent type: explore (read-only), plan (planning), general (full tools). Default: general",
+        description: "Agent type. Default: general",
       },
     },
     required: ["description", "prompt"],
   },
 }
 ```
-
-注意 `type` 不是 required — 默认回退到 `general`。这让 LLM 在不确定时可以不指定类型。
+#### **Python**
+```python
+{
+    "name": "agent",
+    "description": "Launch a sub-agent to handle a task autonomously. Types: 'explore' (read-only), 'plan' (read-only, structured planning), 'general' (full tools).",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string", "description": "Short (3-5 word) description of the sub-agent's task"},
+            "prompt": {"type": "string", "description": "Detailed task instructions for the sub-agent"},
+            "type": {"type": "string", "enum": ["explore", "plan", "general"], "description": "Agent type. Default: general"},
+        },
+        "required": ["description", "prompt"],
+    },
+}
+```
+<!-- tabs:end -->
 
 ### 3. Agent 类改造 — `agent.ts`
 
-Agent 类需要 4 处关键改动来支持子 Agent。
+只需 4 处改动，让同一个 Agent 类同时服务于主 Agent 和子 Agent。
 
 #### 3a. 构造函数：接受自定义配置
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// agent.ts — AgentOptions
-
 interface AgentOptions {
-  yolo?: boolean;
-  model?: string;
-  // ... 其他选项
-  // Sub-agent 专用选项
+  // ...
   customSystemPrompt?: string;
   customTools?: ToolDef[];
   isSubAgent?: boolean;
 }
-```
 
-构造函数中，子 Agent 使用自定义配置，主 Agent 使用默认值：
-
-```typescript
 constructor(options: AgentOptions = {}) {
   this.isSubAgent = options.isSubAgent || false;
-  this.tools = options.customTools || toolDefinitions;     // 子 Agent 用受限工具集
-  this.systemPrompt = options.customSystemPrompt || buildSystemPrompt(); // 子 Agent 用专用 prompt
+  this.tools = options.customTools || toolDefinitions;
+  this.systemPrompt = options.customSystemPrompt || buildSystemPrompt();
   // ...
 }
 ```
+#### **Python**
+```python
+class Agent:
+    def __init__(
+        self,
+        *,
+        # ...
+        custom_system_prompt: str | None = None,
+        custom_tools: list[ToolDef] | None = None,
+        is_sub_agent: bool = False,
+    ):
+        self.is_sub_agent = is_sub_agent
+        self.tools = custom_tools or tool_definitions
+        self._base_system_prompt = custom_system_prompt or build_system_prompt()
+```
+<!-- tabs:end -->
+
+`customTools` 为 `None` 时回退到全量工具列表，对主 Agent 零侵入。
 
 #### 3b. 输出捕获：emitText + outputBuffer
 
-子 Agent 的文本输出不能直接打印到终端，需要收集起来返回给主 Agent：
+子 Agent 的文本输出不能直接打印，需要收集后返回给主 Agent：
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// 子 Agent 的输出缓冲区
 private outputBuffer: string[] | null = null;
 
 private emitText(text: string): void {
   if (this.outputBuffer) {
-    this.outputBuffer.push(text);   // 子 Agent：收集到 buffer
+    this.outputBuffer.push(text);   // 子 Agent：收集
   } else {
     printAssistantText(text);        // 主 Agent：直接打印
   }
 }
 ```
+#### **Python**
+```python
+self._output_buffer: list[str] | None = None
 
-这个设计很巧妙 — 同一个 `emitText` 方法，根据是否有 `outputBuffer` 自动切换行为。流式输出的回调里只需要调 `emitText`，完全不需要知道自己是主 Agent 还是子 Agent。
+def _emit_text(self, text: str) -> None:
+    if self._output_buffer is not None:
+        self._output_buffer.append(text)
+    else:
+        print_assistant_text(text)
+```
+<!-- tabs:end -->
+
+`outputBuffer` 的三态：`null` = 主 Agent 模式（直接打印），`[]` = 子 Agent 模式（开始收集），`[...]` = 正在积累。流式回调只需调 `emitText`，完全不感知自己在哪个模式下运行。
 
 #### 3c. runOnce：一次性执行入口
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 async runOnce(prompt: string): Promise<{ text: string; tokens: { input: number; output: number } }> {
-  this.outputBuffer = [];                          // 开启输出捕获
+  this.outputBuffer = [];
   const prevInput = this.totalInputTokens;
   const prevOutput = this.totalOutputTokens;
-  await this.chat(prompt);                         // 复用完整的 agent loop
-  const text = this.outputBuffer.join("");          // 收集所有输出
-  this.outputBuffer = null;                        // 关闭捕获
+  await this.chat(prompt);                         // 复用完整 agent loop
+  const text = this.outputBuffer.join("");
+  this.outputBuffer = null;
   return {
     text,
     tokens: {
-      input: this.totalInputTokens - prevInput,    // 增量 token 统计
+      input: this.totalInputTokens - prevInput,
       output: this.totalOutputTokens - prevOutput,
     },
   };
 }
 ```
+#### **Python**
+```python
+async def run_once(self, prompt: str) -> dict:
+    self._output_buffer = []
+    prev_in = self.total_input_tokens
+    prev_out = self.total_output_tokens
+    await self.chat(prompt)
+    text = "".join(self._output_buffer)
+    self._output_buffer = None
+    return {
+        "text": text,
+        "tokens": {
+            "input": self.total_input_tokens - prev_in,
+            "output": self.total_output_tokens - prev_out,
+        },
+    }
+```
+<!-- tabs:end -->
 
-`runOnce` 的核心思想：**子 Agent 复用主 Agent 完全相同的 agent loop**（`chat` 方法）。不需要写一套新的循环逻辑。区别只在于输出去向和工具集。
+Token 用增量计算（运行后 - 运行前），因为 Agent 实例的计数器是累积的。`chat()` 完全复用，它不关心自己在主 Agent 还是子 Agent 中——工具集和输出去向已经在构造函数里配置好了。
 
-#### 3d. executeAgentTool：桥接主 Agent 和子 Agent
+#### 3d. executeAgentTool：执行子 Agent
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 private async executeAgentTool(input: Record<string, any>): Promise<string> {
   const type = (input.type || "general") as SubAgentType;
@@ -330,16 +400,14 @@ private async executeAgentTool(input: Record<string, any>): Promise<string> {
   const config = getSubAgentConfig(type);
   const subAgent = new Agent({
     model: this.model,
-    apiBase: this.useOpenAI ? this.openaiClient?.baseURL : undefined,
     customSystemPrompt: config.systemPrompt,
     customTools: config.tools,
     isSubAgent: true,
-    yolo: true, // 子 Agent 不需要用户确认
+    permissionMode: this.permissionMode === "plan" ? "plan" : "bypassPermissions",
   });
 
   try {
     const result = await subAgent.runOnce(prompt);
-    // 将子 Agent 的 token 消耗汇总到父 Agent
     this.totalInputTokens += result.tokens.input;
     this.totalOutputTokens += result.tokens.output;
     printSubAgentEnd(type, description);
@@ -350,39 +418,98 @@ private async executeAgentTool(input: Record<string, any>): Promise<string> {
   }
 }
 ```
+#### **Python**
+```python
+async def _execute_agent_tool(self, inp: dict) -> str:
+    agent_type = inp.get("type", "general")
+    description = inp.get("description", "sub-agent task")
+    prompt = inp.get("prompt", "")
 
-在工具分发层，`agent` 工具被特殊处理（因为它需要访问 Agent 实例）：
+    print_sub_agent_start(agent_type, description)
 
+    config = get_sub_agent_config(agent_type)
+    sub_agent = Agent(
+        model=self.model,
+        custom_system_prompt=config["system_prompt"],
+        custom_tools=config["tools"],
+        is_sub_agent=True,
+        permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+    )
+
+    try:
+        result = await sub_agent.run_once(prompt)
+        self.total_input_tokens += result["tokens"]["input"]
+        self.total_output_tokens += result["tokens"]["output"]
+        print_sub_agent_end(agent_type, description)
+        return result["text"] or "(Sub-agent produced no output)"
+    except Exception as e:
+        print_sub_agent_end(agent_type, description)
+        return f"Sub-agent error: {e}"
+```
+<!-- tabs:end -->
+
+子 Agent 出错时返回错误字符串，不会让父 Agent 崩溃——父 Agent 的 LLM 看到错误信息后可以自行决定重试或换策略。
+
+权限继承：子 Agent 默认 `bypassPermissions`（主 Agent 已授权，子 Agent 不必再询问用户），但 Plan Mode 必须继承——否则子 Agent 可以绕过只读限制，是个安全漏洞。
+
+`agent` 工具需要特殊分发，因为它需要访问当前 Agent 实例状态（model、permissionMode、token 计数器），无法走无状态的通用分发函数：
+
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 private async executeToolCall(name: string, input: Record<string, any>): Promise<string> {
   if (name === "agent") {
-    return this.executeAgentTool(input);  // Agent 内部处理
+    return this.executeAgentTool(input);
   }
-  return executeTool(name, input);         // 其他工具走通用分发
+  return executeTool(name, input);
 }
 ```
+#### **Python**
+```python
+async def _execute_tool_call(self, name: str, inp: dict) -> str:
+    if name == "agent":
+        return await self._execute_agent_tool(inp)
+    if name == "skill":
+        return await self._execute_skill_tool(inp)
+    return await execute_tool(name, inp)
+```
+<!-- tabs:end -->
 
-### 4. isSubAgent 标志的影响
+### 4. isSubAgent 标志
 
-子 Agent 运行时跳过一些只对主 Agent 有意义的操作：
+子 Agent 跳过三个只对主 Agent 有意义的操作：
 
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
-// chat() 结束时
 if (!this.isSubAgent) {
-  printDivider();    // 子 Agent 不打印分隔线
-  this.autoSave();   // 子 Agent 不保存会话
+  printDivider();
+  this.autoSave();
 }
 
-// agent loop 内，响应结束后
 if (!this.isSubAgent) {
-  printCost(this.totalInputTokens, this.totalOutputTokens); // 子 Agent 不打印费用
+  printCost(this.totalInputTokens, this.totalOutputTokens);
 }
 ```
+#### **Python**
+```python
+if not self.is_sub_agent:
+    print_divider()
+    self._auto_save()
+
+if not self.is_sub_agent:
+    print_cost(self.total_input_tokens, self.total_output_tokens)
+```
+<!-- tabs:end -->
+
+- 分隔线：子 Agent 输出已被 buffer 捕获，不会显示在终端
+- 会话保存：子 Agent 是一次性任务，保存其会话无意义，且可能覆盖主 Agent 的文件
+- 费用打印：token 已汇总到父 Agent，子 Agent 自己打印会造成重复计费的错觉
 
 ### 5. 终端 UI — `ui.ts`
 
-子 Agent 的开始和结束用缩进的边框标识，让用户清楚地看到子 Agent 的执行边界：
-
+<!-- tabs:start -->
+#### **TypeScript**
 ```typescript
 export function printSubAgentStart(type: string, description: string) {
   console.log(chalk.magenta(`\n  ┌─ Sub-agent [${type}]: ${description}`));
@@ -392,102 +519,19 @@ export function printSubAgentEnd(type: string, description: string) {
   console.log(chalk.magenta(`  └─ Sub-agent [${type}] completed`));
 }
 ```
+#### **Python**
+```python
+def print_sub_agent_start(agent_type: str, description: str) -> None:
+    console.print(f"\n  [magenta]┌─ Sub-agent [{agent_type}]: {description}[/magenta]")
 
-## 关键设计决策
-
-### 为什么用 fork-return 而不是其他模式？
-
-```mermaid
-graph LR
-    subgraph Fork-Return
-        M1[主 Agent] -->|派生| S1[子 Agent]
-        S1 -->|返回结果| M1
-    end
-
-    subgraph Coordinator
-        C[协调者] -->|分配| W1[Worker 1]
-        C -->|分配| W2[Worker 2]
-        W1 -->|汇报| C
-        W2 -->|汇报| C
-    end
-
-    style M1 fill:#7c5cfc,color:#fff
-    style C fill:#7c5cfc,color:#fff
+def print_sub_agent_end(agent_type: str, _description: str) -> None:
+    console.print(f"  [magenta]└─ Sub-agent [{agent_type}] completed[/magenta]")
 ```
+<!-- tabs:end -->
 
-Fork-return 是最简单也最安全的模式：
+### 6. 自定义 Agent 类型：`.claude/agents/*.md`
 
-1. **无共享状态**：子 Agent 有独立的消息历史，不可能污染主 Agent 的上下文
-2. **确定性**：主 Agent 发一个请求，等一个结果，控制流清晰
-3. **容错简单**：子 Agent 出错，主 Agent 拿到错误信息继续工作
-4. **Token 可追踪**：所有子 Agent 消耗直接汇总到父 Agent
-
-### 为什么子 Agent 不能创建子 Agent？
-
-General Agent 的工具列表里过滤掉了 `agent`：
-
-```typescript
-tools: toolDefinitions.filter((t) => t.name !== "agent")
-```
-
-这是一个关键的安全决策：
-
-- **防止无限递归**：A 创建 B，B 创建 C，C 创建 D... 无限嵌套会耗尽资源
-- **Token 爆炸**：每层子 Agent 都有自己的系统提示词和消息历史，嵌套几层就会消耗大量 token
-- **调试困难**：多层嵌套的 Agent 调用链极难追踪和调试
-
-Claude Code 也做了同样的限制。在实践中，1 层子 Agent 已经能覆盖绝大多数场景。
-
-### 为什么子 Agent 设置 bypassPermissions？
-
-```typescript
-const subAgent = new Agent({
-  // ...
-  permissionMode: "bypassPermissions", // 子 Agent 不需要用户确认
-});
-```
-
-子 Agent 跳过所有权限确认，原因是：
-
-1. **用户体验**：主 Agent 已经被用户授权执行某个任务，子 Agent 再反复询问用户会中断工作流
-2. **工具已受限**：explore 和 plan 只有只读工具，general 虽有写权限但这是用户主动选择的
-3. **一致性**：Claude Code 的子 Agent 也是自动执行，不会中途询问用户
-
-### 为什么 explore/plan 保留 run_shell？
-
-看起来违反直觉 — "只读"的 Agent 怎么能执行 shell 命令？
-
-但 shell 命令的读能力远比其他只读工具强大。`git log --oneline -20`、`find . -name "*.ts" | wc -l`、`cat package.json | jq .dependencies` 这些命令是代码探索的核心手段。如果去掉 shell，explore Agent 的能力会大打折扣。
-
-安全性通过 **system prompt 约束** 来保证，而不是彻底禁止工具。这与 Claude Code 的做法一致 — 它的 explore Agent 也保留了受限的 BashTool。
-
-### 为什么输出用 buffer 收集而不是回调？
-
-```typescript
-// 方案 A（我们的实现）：buffer 收集
-private outputBuffer: string[] | null = null;
-private emitText(text: string): void {
-  if (this.outputBuffer) {
-    this.outputBuffer.push(text);
-  } else {
-    printAssistantText(text);
-  }
-}
-
-// 方案 B（回调方式）：
-// constructor(options: { onText?: (text: string) => void })
-// 每次输出时 this.options.onText?.(text)
-```
-
-选择 buffer 而不是回调的原因：
-
-- **改动最小**：只在 `emitText` 一处判断，不需要修改 agent loop 的任何逻辑
-- **结果完整性**：buffer 确保收集到子 Agent 的所有输出，不会因为异步回调丢失片段
-- **生命周期清晰**：`runOnce` 开启 buffer → `chat` 写入 → `runOnce` 收集并关闭，边界明确
-
-### 自定义 Agent 类型：`.claude/agents/*.md`
-
-除了 3 种内置类型，用户可以通过 Markdown 文件定义自己的 Agent 类型——与 Claude Code 的 `.claude/agents/` 完全一致：
+与 Claude Code 的 `.claude/agents/` 完全一致的扩展方式：
 
 ```markdown
 <!-- .claude/agents/reviewer.md -->
@@ -502,49 +546,26 @@ You are a code reviewer. Analyze the code thoroughly and report:
 3. Performance concerns
 ```
 
-**发现机制**：
+发现机制：项目级（`.claude/agents/`）优先级高于用户级（`~/.claude/agents/`），同名覆盖。frontmatter 复用 `parseFrontmatter()`，与 Memory 和 Skills 共享同一套解析器。
 
-```typescript
-// subagent.ts — discoverCustomAgents
+## 关键设计决策
 
-function discoverCustomAgents(): Map<string, CustomAgentDef> {
-  const agents = new Map();
-  // 用户级（低优先）
-  loadAgentsFromDir(join(homedir(), ".claude", "agents"), agents);
-  // 项目级（高优先，同名覆盖）
-  loadAgentsFromDir(join(process.cwd(), ".claude", "agents"), agents);
-  return agents;
-}
-```
+### Fork-return 为什么比 Coordinator 更适合作为起点？
 
-**与内置类型的集成**：
+Fork-return 的优势很简单：无共享状态（不可能污染主 Agent 上下文）、控制流确定（发请求等结果）、容错简单（子 Agent 出错主 Agent 继续工作）。Coordinator 在任务并行化上更强，但需要处理 Worker 之间的信息共享、冲突，复杂度高一个数量级。
 
-```typescript
-export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
-  // 先查自定义 Agent
-  const custom = discoverCustomAgents().get(type);
-  if (custom) {
-    const tools = custom.allowedTools
-      ? toolDefinitions.filter(t => custom.allowedTools!.includes(t.name))
-      : toolDefinitions.filter(t => t.name !== "agent");
-    return { systemPrompt: custom.systemPrompt, tools };
-  }
-  // Fallback 到内置类型
-  switch (type) { /* explore, plan, general */ }
-}
-```
+### 为什么子 Agent 不能创建子 Agent？
 
-frontmatter 复用 `parseFrontmatter()`（与 Memory 和 Skills 共享），用户学一套语法就能扩展三个系统。
+General Agent 工具列表里过滤掉了 `agent`。不限制的话，A 创建 B、B 创建 C 的递归嵌套会指数级消耗 token——每层都有自己的系统提示词和消息历史。Claude Code 做了同样的限制，实践中 1 层已覆盖绝大多数场景。
 
-### 总结：174 行实现的核心取舍
+### 为什么 explore/plan 保留 run_shell？
 
-| 我们保留的 | 我们省略的 | 为什么 |
-|-----------|-----------|--------|
-| 3 种内置 + 自定义 Agent 类型 | plugin-provided Agent 类型 | 自定义文件覆盖绝大多数场景 |
-| 只读工具集隔离 | 4 层工具过滤管道 | 固定类型 + 自定义 allowed-tools 够用 |
-| 独立消息历史 | prompt cache 共享优化（fork 模式） | 独立 Agent 实例天然隔离 |
-| Token 汇总到父 Agent | 子进程 fork 优化 | 单进程内创建即可 |
-| 禁止递归创建子 Agent | Worktree 隔离 | 串行已够用，避免复杂度 |
-| System prompt 约束安全 | AST 级命令分析 | Prompt 约束在实践中足够有效 |
+`git log --oneline -20`、`find . -name "*.ts" | wc -l` 这类只读 shell 命令是代码探索的核心手段，完全禁止会大幅削弱能力。这个设计与 Claude Code 的 Explore Agent 一致——用 system prompt 约束而非彻底禁用工具。
 
-这 174 行代码展示了一个重要的架构原则：**子 Agent 本质上就是一个配置不同的 Agent 实例**。通过给 Agent 类添加少量可选参数（`customTools`、`customSystemPrompt`、`isSubAgent`），我们让同一套 agent loop 同时服务于主 Agent 和子 Agent，避免了代码重复。自定义 Agent 类型让用户无需修改代码就能扩展系统——与 Claude Code 的扩展方式完全对齐。
+### 为什么用 buffer 收集输出而不是回调？
+
+回调方案需要把 `onText` 传入构造函数，然后在 agent loop 里到处判断。Buffer 方案只改 `emitText` 一处，`runOnce` 开启、`chat` 写入、`runOnce` 收集并关闭，生命周期边界清晰，对现有代码零侵入。
+
+---
+
+整个实现的核心洞察：**子 Agent 本质上就是一个配置不同的 Agent 实例**。通过给 Agent 类添加少量可选参数（`customTools`、`customSystemPrompt`、`isSubAgent`），同一套 agent loop 同时服务于主 Agent 和子 Agent，避免了代码重复。
