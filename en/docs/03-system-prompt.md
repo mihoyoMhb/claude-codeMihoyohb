@@ -1,74 +1,74 @@
-# 3. System Prompt 工程
+# 3. System Prompt Engineering
 
-## 本章目标
+## Chapter Goals
 
-构造一个让 LLM 成为合格 coding agent 的 System Prompt：告诉它身份、规则、工具使用策略和环境信息。
+Construct a System Prompt that turns an LLM into a competent coding agent: telling it its identity, rules, tool usage strategies, and environment information.
 
 ```mermaid
 graph TB
-    Template[SYSTEM_PROMPT_TEMPLATE<br/>内联 Markdown 模板] --> Builder[buildSystemPrompt<br/>变量替换]
-    CWD[工作目录] --> Builder
-    Git[Git 信息] --> Builder
-    ClaudeMD[CLAUDE.md<br/>项目指令] --> Builder
-    Memory[记忆系统] --> Builder
-    Skills[技能描述] --> Builder
-    Agents[Agent 描述] --> Builder
-    Builder --> Final[最终 System Prompt]
-    Final --> API[传给 API<br/>system 参数]
+    Template[SYSTEM_PROMPT_TEMPLATE<br/>Inline Markdown Template] --> Builder[buildSystemPrompt<br/>Variable Substitution]
+    CWD[Working Directory] --> Builder
+    Git[Git Info] --> Builder
+    ClaudeMD[CLAUDE.md<br/>Project Instructions] --> Builder
+    Memory[Memory System] --> Builder
+    Skills[Skills Descriptions] --> Builder
+    Agents[Agent Descriptions] --> Builder
+    Builder --> Final[Final System Prompt]
+    Final --> API[Passed to API<br/>system parameter]
 
     style Builder fill:#7c5cfc,color:#fff
     style Final fill:#e8e0ff
 ```
 
-## Claude Code 怎么做的
+## How Claude Code Does It
 
-Claude Code 的 System Prompt 不是随意堆砌的指令，而是经过大量 A/B 测试和模型行为观察迭代打磨的工程产物。
+Claude Code's System Prompt is not a haphazard pile of instructions -- it's an engineering artifact, iteratively refined through extensive A/B testing and model behavior observation.
 
-### 7 层递进结构
+### 7-Layer Progressive Structure
 
-提示词从抽象到具体分为 7 层——**先建立身份和约束框架，再填充具体行为指导**。这个顺序很重要：模型先建立的概念会成为理解后续内容的框架。
+The prompt is organized from abstract to concrete in 7 layers -- **first establishing the identity and constraint framework, then filling in specific behavioral guidance**. This order matters: concepts the model establishes first become the framework for understanding subsequent content.
 
 ```
-1. Identity   → 我是谁？interactive agent
-2. System     → 运行环境的基本事实
-3. Doing Tasks → 怎么写代码？（反模式接种）
-4. Actions    → 哪些操作需要确认？（爆炸半径框架）
-5. Using Tools → 怎么用工具？（偏好映射表）
-6. Tone & Style → 输出什么格式？
-7. Output Efficiency → 怎么更简洁？
+1. Identity   -> Who am I? interactive agent
+2. System     -> Basic facts about the runtime environment
+3. Doing Tasks -> How to write code? (anti-pattern inoculation)
+4. Actions    -> Which operations need confirmation? (blast radius framework)
+5. Using Tools -> How to use tools? (preference mapping table)
+6. Tone & Style -> What output format?
+7. Output Efficiency -> How to be more concise?
 ```
 
-### 反模式接种
+### Anti-Pattern Inoculation
 
-**明确告诉模型"不要做什么"，比只描述"要做什么"有效得多。**
+**Explicitly telling the model "what not to do" is far more effective than only describing "what to do."**
 
-正面指令（"be concise"）给模型留下了自我合理化的空间——它会认为"加注释是让代码更简洁易读的"，然后给每个函数加 docstring。而负面指令（"don't add docstrings to code you didn't change"）消除了解释余地。
+Positive instructions ("be concise") leave room for the model to self-rationalize -- it may think "adding comments makes code more concise and readable," then add docstrings to every function. Negative instructions ("don't add docstrings to code you didn't change") eliminate room for interpretation.
 
-Claude Code 的 Doing Tasks 部分有三条精确的"不要"：
+Claude Code's Doing Tasks section has three precise "don'ts":
 
-- **不要扩大范围**：修 bug 不需要顺手重构周围代码
-- **不要防御性编程**：不为不可能发生的场景加 try-catch 和校验
-- **不要过早抽象**："Three similar lines of code is better than a premature abstraction"
+- **Don't expand scope**: Fixing a bug doesn't mean refactoring surrounding code
+- **Don't code defensively**: Don't add try-catch and validation for impossible scenarios
+- **Don't abstract prematurely**: "Three similar lines of code is better than a premature abstraction"
 
-这些规则的价值不在概念（谁都知道"不要过度工程"），而在**措辞的精确度**——给了模型具体的判断标准，而非模糊的原则。
+The value of these rules is not in the concepts (everyone knows "don't over-engineer"), but in the **precision of the wording** -- giving the model specific judgment criteria rather than vague principles.
 
-### 爆炸半径框架
+### Blast Radius Framework
 
-Actions 部分没有罗列"不能做 X、Y、Z"，而是教给模型一个**风险评估框架**：
+The Actions section doesn't enumerate "can't do X, Y, Z" -- instead it teaches the model a **risk assessment framework**:
 
 ```
 Carefully consider the reversibility and blast radius of actions.
 ```
 
-二维模型：**可逆性 × 影响范围**。高风险 = 不可逆 + 影响共享环境（force push、删除云资源）；低风险 = 可逆 + 只影响本地（编辑本地文件）。
+A two-dimensional model: **reversibility x impact scope**. High risk = irreversible + affects shared environments (force push, deleting cloud resources); low risk = reversible + local impact only (editing local files).
 
-这比穷举规则扩展性强得多——模型遇到规则列表之外的新场景（比如调用 API 删除云资源）能自行推理，而不是不知道怎么做。
+This scales far better than exhaustive rules -- when the model encounters a new scenario not on the rule list (like calling an API to delete cloud resources), it can reason on its own rather than not knowing what to do.
 
-还有一条关键规则：用户批准一次操作，不等于批准所有类似操作。每次授权只对当前范围有效。
+There's also a critical rule: a user approving one operation does not mean they approve all similar operations. Each authorization is valid only for the current scope.
 
-### 工具偏好映射表
+### Tool Preference Mapping Table
 
-Claude Code 在提示词中明确要求模型用专用工具而非 bash 命令：
+Claude Code explicitly requires the model to use dedicated tools rather than bash commands in the prompt:
 
 ```
 Use Read instead of cat/head/tail
@@ -77,19 +77,19 @@ Use Glob instead of find/ls
 Use Grep instead of grep/rg
 ```
 
-专用工具和 bash 命令底层功能差不多，差异在用户体验：权限可以细粒度控制（读取 vs 写入分开授权）、输出结构化、原生支持并行调用。没有这张映射表，模型会默认用训练数据中出现最多的方式——即各种 bash 命令。
+Dedicated tools and bash commands are functionally similar at the low level; the difference is in user experience: permissions can be fine-grained (separate authorization for reads vs. writes), output is structured, and parallel calling is natively supported. Without this mapping table, the model defaults to what appears most in training data -- various bash commands.
 
-### CLAUDE.md 层级发现
+### CLAUDE.md Hierarchical Discovery
 
-CLAUDE.md 是项目级指令文件，类似 `.eslintrc` 但面向 AI。Claude Code 从 5 个位置加载：全局管理策略 → 用户主目录 → 项目目录（CWD 向上遍历）→ 本地文件 → 命令行指定目录。
+CLAUDE.md is a project-level instruction file, similar to `.eslintrc` but for AI. Claude Code loads it from 5 locations: global admin policy -> user home directory -> project directory (traversing upward from CWD) -> local files -> command-line specified directory.
 
-靠近 CWD 的文件**后加载、优先级更高**——利用 LLM 的近因效应，子目录规则可以覆盖父目录规则。
+Files closer to CWD are **loaded later with higher priority** -- leveraging the LLM's recency bias, subdirectory rules can override parent directory rules.
 
-## 我们的实现
+## Our Implementation
 
 ### SYSTEM_PROMPT_TEMPLATE
 
-模板内联在 `prompt.ts` 中，用 `{{placeholder}}` 标记动态变量：
+The template is inline in `prompt.ts`, using `{{placeholder}}` to mark dynamic variables:
 
 ```typescript
 const SYSTEM_PROMPT_TEMPLATE = `You are Mini Claude Code, a lightweight coding assistant CLI.
@@ -146,9 +146,9 @@ Shell: {{shell}}
 {{agents}}`;
 ```
 
-`{{memory}}`、`{{skills}}`、`{{agents}}` 放在末尾——近因效应，这些动态内容的权重更大（详见第 8、9 章）。
+`{{memory}}`, `{{skills}}`, `{{agents}}` are placed at the end -- recency bias gives these dynamic contents higher weight (see Chapters 8 and 9 for details).
 
-### prompt.ts 实现
+### prompt.ts Implementation
 
 <!-- tabs:start -->
 #### **TypeScript**
@@ -170,7 +170,7 @@ export function loadClaudeMd(): string {
     if (existsSync(file)) {
       try {
         let content = readFileSync(file, "utf-8");
-        content = resolveIncludes(content, dir);  // @include 解析
+        content = resolveIncludes(content, dir);  // @include resolution
         parts.unshift(content);
       } catch {}
     }
@@ -235,7 +235,7 @@ def load_claude_md() -> str:
         if f.is_file():
             try:
                 content = f.read_text()
-                content = resolve_includes(content, str(d))  # @include 解析
+                content = resolve_includes(content, str(d))  # @include resolution
                 parts.insert(0, content)
             except Exception:
                 pass
@@ -288,26 +288,26 @@ def build_system_prompt() -> str:
 ```
 <!-- tabs:end -->
 
-### 简化取舍
+### Simplification Trade-offs
 
-| Claude Code | mini-claude | 理由 |
-|------------|-------------|------|
-| Static/Dynamic 缓存边界 | 不实现 | 教程项目无需优化 API 成本 |
-| CLAUDE.md 5 层发现 + .claude 子目录 | 从 CWD 向上遍历 + .claude/rules/ | 覆盖常见场景 |
-| @include 指令 | 支持 @./path、@~/path、@/path | 完整实现 |
-| 反模式接种（3 条规则） | 完整保留 | 对输出质量影响极大 |
-| 爆炸半径框架 | 完整保留 | 安全性不能简化 |
-| 工具偏好映射表 | 适配工具名保留 | 必须有，否则模型默认用 bash |
-| Deferred 工具名注入 | getDeferredToolNames() | 告知模型哪些工具可按需激活 |
+| Claude Code | mini-claude | Reason |
+|------------|-------------|--------|
+| Static/Dynamic cache boundary | Not implemented | Tutorial project doesn't need API cost optimization |
+| CLAUDE.md 5-layer discovery + .claude subdirectory | Traverse upward from CWD + .claude/rules/ | Covers common scenarios |
+| @include directive | Supports @./path, @~/path, @/path | Full implementation |
+| Anti-pattern inoculation (3 rules) | Fully preserved | Huge impact on output quality |
+| Blast radius framework | Fully preserved | Security cannot be simplified |
+| Tool preference mapping table | Adapted to tool names, preserved | Essential -- otherwise the model defaults to bash |
+| Deferred tool name injection | getDeferredToolNames() | Tells the model which tools can be activated on demand |
 
-### @include 语法与 Rules 自动加载
+### @include Syntax and Rules Auto-Loading
 
-CLAUDE.md 文件支持 `@` 语法引用外部文件，实现项目配置的模块化。同时，`.claude/rules/*.md` 目录下的规则文件会自动加载。
+CLAUDE.md files support `@` syntax to reference external files, enabling modular project configuration. Additionally, rule files in the `.claude/rules/*.md` directory are auto-loaded.
 
 <!-- tabs:start -->
 #### **TypeScript**
 ```typescript
-// prompt.ts — @include 解析
+// prompt.ts -- @include resolution
 
 const INCLUDE_REGEX = /^@(\.\/[^\s]+|~\/[^\s]+|\/[^\s]+)$/gm;
 const MAX_INCLUDE_DEPTH = 5;
@@ -343,22 +343,22 @@ function resolveIncludes(
 ```
 <!-- tabs:end -->
 
-三种路径格式：
-- `@./relative/path` — 相对于当前 CLAUDE.md 所在目录
-- `@~/path` — 相对于用户 home 目录
-- `@/absolute/path` — 绝对路径
+Three path formats:
+- `@./relative/path` -- Relative to the directory containing the current CLAUDE.md
+- `@~/path` -- Relative to the user's home directory
+- `@/absolute/path` -- Absolute path
 
-防护措施：
-- **visited Set** 防止循环引用（A include B，B include A）
-- **MAX_INCLUDE_DEPTH = 5** 防止嵌套过深
-- 找不到文件时留下 HTML 注释标记，不报错中断
+Safeguards:
+- **visited Set** prevents circular references (A includes B, B includes A)
+- **MAX_INCLUDE_DEPTH = 5** prevents excessive nesting
+- Missing files leave an HTML comment marker rather than erroring out
 
-`.claude/rules/*.md` 自动加载：
+`.claude/rules/*.md` auto-loading:
 
 <!-- tabs:start -->
 #### **TypeScript**
 ```typescript
-// prompt.ts — 规则目录加载
+// prompt.ts -- Rules directory loading
 
 function loadRulesDir(dir: string): string {
   const rulesDir = join(dir, ".claude", "rules");
@@ -367,7 +367,7 @@ function loadRulesDir(dir: string): string {
   const parts: string[] = [];
   for (const file of files) {
     let content = readFileSync(join(rulesDir, file), "utf-8");
-    content = resolveIncludes(content, rulesDir);  // 规则文件也支持 @include
+    content = resolveIncludes(content, rulesDir);  // Rule files also support @include
     parts.push(`<!-- rule: ${file} -->\n${content}`);
   }
   return parts.length > 0 ? "\n\n## Rules\n" + parts.join("\n\n") : "";
@@ -375,7 +375,7 @@ function loadRulesDir(dir: string): string {
 ```
 <!-- tabs:end -->
 
-使用示例：
+Usage example:
 
 ```markdown
 # CLAUDE.md
@@ -385,9 +385,9 @@ function loadRulesDir(dir: string): string {
 This project uses TypeScript with strict mode.
 ```
 
-加载后，引用会被替换为文件内容。这让团队可以把共享规则放在 `.claude/rules/` 目录下，CLAUDE.md 只需一行引用。
+After loading, references are replaced with file contents. This lets teams put shared rules in the `.claude/rules/` directory, and CLAUDE.md only needs a one-line reference.
 
-loadClaudeMd 整合了三者：向上遍历 CLAUDE.md + @include 解析 + rules 目录：
+loadClaudeMd integrates all three: upward CLAUDE.md traversal + @include resolution + rules directory:
 
 ```typescript
 export function loadClaudeMd(): string {
@@ -397,7 +397,7 @@ export function loadClaudeMd(): string {
     const file = join(dir, "CLAUDE.md");
     if (existsSync(file)) {
       let content = readFileSync(file, "utf-8");
-      content = resolveIncludes(content, dir);  // 每个 CLAUDE.md 都解析 @include
+      content = resolveIncludes(content, dir);  // Each CLAUDE.md resolves @include
       parts.unshift(content);
     }
     const parent = resolve(dir, "..");
@@ -414,4 +414,4 @@ export function loadClaudeMd(): string {
 
 ---
 
-> **下一章**：有了工具和提示词，下一步是让 Agent 变得可交互——CLI 入口、REPL 循环和会话持久化。
+> **Next chapter**: With tools and prompts in place, the next step is making the Agent interactive -- CLI entry, REPL loop, and session persistence.
