@@ -293,20 +293,20 @@ this.permissionMode = options.permissionMode
 | REPL 配套 | `showCost` | 打印当前 token 和费用估算 | 调用 `getCurrentCostUsd` |
 | 预算控制 | `getCurrentCostUsd` | 计算费用估算 | 返回 number |
 | 预算控制 | `checkBudget` | 判断是否超预算或超轮数 | 返回 `{ exceeded, reason? }` |
-| 压缩入口 | `compact` | 手动触发压缩 | 调用 `compactConversation` |
+| 压缩入口 | `compact` | REPL 里配合 `/compact` 手动触发摘要压缩 | 只是转调 `compactConversation()` |
 | 会话恢复 | `restoreSession` | 从保存的会话恢复消息历史 | 覆盖 messages |
 | 会话恢复 | `getMessageCount` | 获取当前消息条数 | 根据后端取数组长度 |
 | 自动保存 | `autoSave` | 把当前会话写入 session 文件 | 调用 `saveSession` |
-| 自动压缩 | `checkAndCompact` | 超过阈值时自动压缩 | 检查 `lastInputTokenCount` |
-| 压缩入口 | `compactConversation` | 根据后端选择压缩实现 | 调 `compactOpenAI` / `compactAnthropic` |
-| 摘要压缩 | `compactAnthropic` | 用 Anthropic 生成对话摘要并替换旧历史 | 重建 `anthropicMessages` |
-| 摘要压缩 | `compactOpenAI` | 用 OpenAI 生成对话摘要并替换旧历史 | 重建 `openaiMessages` |
-| 多层压缩 | `runCompressionPipeline` | 执行 budget / snip / microcompact 三层本地压缩 | 选择对应后端逻辑 |
-| 多层压缩 | `budgetToolResults*` | 对过大的工具结果做中间裁剪 | 截断超长内容 |
-| 多层压缩 | `snipStaleResults*` | 对旧结果、重复结果做替换 | 用 `SNIP_PLACEHOLDER` 代替 |
-| 多层压缩 | `microcompact*` | 长时间闲置后清理更旧的工具结果 | 用 `[Old result cleared]` 代替 |
+| 自动压缩 | `checkAndCompact` | 单轮结束后检查是否需要做摘要压缩 | 根据 `lastInputTokenCount` 和 `effectiveWindow` 判断 |
+| 压缩入口 | `compactConversation` | 摘要压缩统一入口 | 按后端调 `compactOpenAI()` / `compactAnthropic()`，最后打印 `Conversation compacted.` |
+| 摘要压缩 | `compactAnthropic` | 用 Anthropic 再发一次“总结对话”请求，替换旧历史 | 重建 `anthropicMessages`，并尽量保留最后一条用户消息 |
+| 摘要压缩 | `compactOpenAI` | 用 OpenAI-compatible 接口生成摘要后替换旧历史 | 重建 `openaiMessages`，保留 `systemMsg` 和最后一条用户消息 |
+| 多层压缩 | `runCompressionPipeline` | 每次真正发 API 前，执行 budget / snip / microcompact 三层本地压缩 | `chatAnthropic()` / `chatOpenAI()` 循环里都会先调用 |
+| 多层压缩 | `budgetToolResults*` | 上下文利用率升高时，先裁剪过长工具结果 | 只改工具结果，保头保尾截断中间内容 |
+| 多层压缩 | `snipStaleResults*` | 把较旧或重复工具结果替换成占位符 | 用 `SNIP_PLACEHOLDER` 代替，Anthropic 版还会结合 `tool_use_id` 判断工具来源 |
+| 多层压缩 | `microcompact*` | 闲置超过 5 分钟后，更激进清理旧工具结果 | 保留最近 `KEEP_RECENT_RESULTS` 条，其余替换成 `[Old result cleared]` |
 | 查找辅助 | `findToolUseById` | 根据 tool use id 找到原工具信息 | 返回 `{ name, input } \| null` |
-| 工具分发 | `executeToolCall` | 统一处理 tool 调用分发 | 特判 `agent` / `skill` / plan tools |
+| 工具分发 | `executeToolCall` | 统一处理普通工具、plan tools、skill、sub-agent、MCP 工具分发 | 普通工具会带上 `readFileState`，MCP 工具转给 `mcpManager` |
 | Skill | `executeSkillTool` | 执行 skill，支持 inline 和 fork 两种模式 | 可能返回 prompt，也可能运行子代理 |
 | Plan mode | `generatePlanFilePath` | 生成 plan 文件路径 | 使用 `~/.claude/plans` |
 | Plan mode | `buildPlanModePrompt` | 构建 plan mode 专用 system prompt 追加内容 | 返回大段字符串 |
@@ -721,6 +721,15 @@ return costIn + costOut;
 await this.compactConversation();
 ```
 
+实际用法：
+- 在 REPL 里输入 `/compact`
+- `cli.ts` 会调用 `agent.compact()`
+- 然后这里再进入 `compactConversation()`
+
+一句话理解：
+- `compact()` 本身不决定怎么压缩
+- 它只是给 REPL 暴露一个“手动压缩入口”
+
 ### 8.6 `restoreSession(data)`
 
 作用：
@@ -838,6 +847,14 @@ if (this.useOpenAI) {
 printInfo("Conversation compacted.");
 ```
 
+这一步的实际用法有两个入口：
+- 手动入口：用户在 REPL 输入 `/compact`，最终会走到这里
+- 自动入口：`chatAnthropic()` / `chatOpenAI()` 每轮结束后都会 `await this.checkAndCompact()`，满足阈值时也会走到这里
+
+所以可以把它理解成：
+- “摘要压缩总闸门”
+- 不管是手动还是自动，真正执行摘要压缩都要经过它
+
 ### 9.3 `compactAnthropic()`
 
 作用：
@@ -855,6 +872,21 @@ printInfo("Conversation compacted.");
 为什么要保留最后一条用户消息：
 - 避免压缩之后丢掉当前任务上下文
 
+代码里的重建结果可以直接记成：
+
+```ts
+[
+  { role: "user", content: `[Previous conversation summary]\n${summaryText}` },
+  { role: "assistant", content: "Understood..." },
+  // 如果最后一条原本就是 user，再把它补回去
+]
+```
+
+也就是说：
+- 旧历史不会原样保留
+- 会被折叠成“一条摘要 user 消息 + 一条确认 assistant 消息”
+- 当前这轮尚未处理完的最后一条用户请求，尽量继续保留
+
 ### 9.4 `compactOpenAI()`
 
 作用：
@@ -863,6 +895,21 @@ printInfo("Conversation compacted.");
 区别点：
 - OpenAI 这边 `system` 是消息数组的第一条
 - 所以压缩后要把原来的 `systemMsg` 保留在最前面
+
+可以把重建后的结构理解成：
+
+```ts
+[
+  systemMsg,
+  { role: "user", content: `[Previous conversation summary]\n${summaryText}` },
+  { role: "assistant", content: "Understood..." },
+  // 必要时补回 lastUserMsg
+]
+```
+
+所以它和 Anthropic 版最大的差别不是“摘要逻辑不同”，而是：
+- OpenAI 的 system prompt 在消息数组里
+- Anthropic 的 system prompt 是单独参数传给 API
 
 ### 9.5 这两种压缩的本质
 
@@ -939,11 +986,31 @@ if (this.useOpenAI) {
 }
 ```
 
+实际调用位置非常重要：
+
+```ts
+while (true) {
+  ...
+  this.runCompressionPipeline();
+  const response = await this.callXXXStream(...);
+  ...
+}
+```
+
+也就是：
+- 每次真正请求模型前，都会先跑一次本地三层压缩
+- 这三层不需要额外 API 成本
+- 它们的目标是尽量避免太早进入更重的摘要压缩
+
 ### 10.2 第一层：`budgetToolResults*`
 
 作用：
 - 当上下文使用率开始升高时
 - 对特别长的工具结果做“保头保尾”的裁剪
+
+它只处理工具结果，不处理普通用户消息或 assistant 文本：
+- Anthropic: 只看 `user` 消息里的 `tool_result block`
+- OpenAI: 只看 `role === "tool"` 的消息
 
 判断逻辑：
 
@@ -998,6 +1065,10 @@ OpenAI 版本的关键思路：
 - 收集所有 `role === "tool"` 的消息
 - 除最近 N 条外，其余替换为占位符
 
+这里要特别注意一个“代码层面的差异”：
+- Anthropic 版会尽量识别“同一个文件被重复 `read_file`”这种情况，优先 snip 旧结果
+- OpenAI 版当前实现没有回溯具体工具输入，只是简单按时间顺序保留最近 N 条
+
 ### 10.4 第三层：`microcompact*`
 
 作用：
@@ -1021,6 +1092,11 @@ if (!this.lastApiCallTime || (Date.now() - this.lastApiCallTime) < MICROCOMPACT_
 ```ts
 "[Old result cleared]"
 ```
+
+怎么理解这一层的用法：
+- 它不是看“上下文快满没满”
+- 而是看“距离上次 API 调用是不是已经过去很久”
+- 如果缓存已经变冷，就把更旧的工具结果进一步清掉，给后续轮次腾空间
 
 ### 10.5 `findToolUseById(toolUseId)`
 
@@ -1074,7 +1150,7 @@ if (!this.lastApiCallTime || (Date.now() - this.lastApiCallTime) < MICROCOMPACT_
 
 这一组的地位很重要：
 - 它们把“工具调用”这件事和 Agent 主循环接起来
-- 也把 skill、plan mode、sub-agent 这些高级能力组织起来
+- 也把 skill、plan mode、sub-agent、MCP 这些高级能力组织起来
 
 ### 11.1 `executeToolCall(name, input)`
 
@@ -1087,14 +1163,26 @@ if (!this.lastApiCallTime || (Date.now() - this.lastApiCallTime) < MICROCOMPACT_
 if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
 if (name === "agent") return this.executeAgentTool(input);
 if (name === "skill") return this.executeSkillTool(input);
-return executeTool(name, input);
+if (this.mcpManager.isMcpTool(name)) return this.mcpManager.callTool(name, input);
+return executeTool(name, input, this.readFileState);
 ```
 
 怎么理解：
-- 大多数普通工具，直接交给 `executeTool(...)`
-- 但 `agent`、`skill`、plan mode 工具有特殊逻辑，所以在这里单独拦截处理
+- `plan mode` 工具先走内部状态切换逻辑
+- `agent` 工具会拉起一个真正的 sub-agent
+- `skill` 工具会走 skill 分发
+- 如果工具名属于 MCP server 提供的工具，就转给 `mcpManager.callTool(...)`
+- 剩下的普通本地工具，才交给 `executeTool(...)`
 
 这个函数相当于“工具分发器”。
+
+这里还有一个容易忽略的变化：
+- 普通工具现在不是简单 `executeTool(name, input)`
+- 而是 `executeTool(name, input, this.readFileState)`
+
+这表示：
+- 工具执行层现在还能拿到“文件上次读取状态”
+- 给后面的 read-before-edit 保护做辅助判断
 
 ### 11.2 `executeSkillTool(input)`
 
@@ -1130,7 +1218,8 @@ return `[Skill "${input.skill_name}" activated]\n\n${result.prompt}`;
 
 也就是：
 - 不开子代理
-- 直接把 skill prompt 返回给当前上下文
+- 直接把 skill prompt 作为 tool result 返回给当前上下文
+- 下一轮模型就能把这段 prompt 当成额外工作指令继续用
 
 #### `fork` 模式
 
@@ -1146,6 +1235,27 @@ return `[Skill "${input.skill_name}" activated]\n\n${result.prompt}`;
 这里的关键点：
 - `fork` 模式真的会开一个新的 Agent 实例
 - 但这个子代理的工具集、system prompt 可以和主代理不一样
+
+更贴近代码地看，有两个分支：
+
+1. 如果 skill 返回了 `allowedTools`
+- 就从当前 `this.tools` 里只保留这些工具
+
+2. 如果 skill 没限制工具
+- 默认会把 `agent` 工具排除掉：
+
+```ts
+this.tools.filter(t => t.name !== "agent")
+```
+
+这样做的意图是：
+- skill fork 默认不开启“再继续套娃开子代理”
+- 先把 skill 子代理限制在一个更可控的范围里
+
+另外这个 sub-agent 的关键配置也值得记一下：
+- `customSystemPrompt` 用的是 `result.prompt`
+- `permissionMode` 如果主代理当前在 `plan`，子代理也跟着 `plan`
+- 否则 skill fork 子代理直接用 `bypassPermissions`
 
 ### 11.3 `generatePlanFilePath()`
 
@@ -1167,10 +1277,10 @@ return `[Skill "${input.skill_name}" activated]\n\n${result.prompt}`;
 
 这段文字会追加到原始 system prompt 后面，告诉模型：
 - 现在处于 plan mode
-- 不能改代码
-- 只能读
-- 只能写 plan 文件
-- 完成后要调用 `exit_plan_mode`
+- 不能做普通编辑，也不能运行非只读工具
+- 只能编辑 plan 文件
+- 复杂任务可以用 `agent` 工具并指定 `type="plan"`
+- 完成后必须调用 `exit_plan_mode`
 
 这段函数的本质不是“执行 plan mode”，而是“生成 plan mode 的提示词文本”。
 
@@ -1184,6 +1294,7 @@ return `[Skill "${input.skill_name}" activated]\n\n${result.prompt}`;
 它和 `togglePlanMode()` 的区别：
 - `togglePlanMode()` 是 REPL 的 `/plan` 命令入口
 - `executePlanModeTool()` 是模型工具调用入口
+- 后者还负责 plan 文件读取、审批分支和退出后的后续执行准备
 
 #### `enter_plan_mode`
 
@@ -1201,6 +1312,10 @@ return "Already in plan mode.";
 5. 如果是 OpenAI-compatible，同步更新第一条 system message
 6. 打印提示
 7. 返回一段说明文字给模型
+
+这一段和 `togglePlanMode()` 很像，但更偏“工具协议”：
+- 不只是切状态
+- 还会把 plan 文件路径和后续操作规则明确返回给模型
 
 #### `exit_plan_mode`
 
@@ -1221,6 +1336,36 @@ return "Already in plan mode.";
 7. 必要时清空上下文，但保留 system prompt
 8. 把 plan 内容包装成返回文本交还给模型
 
+审批结果在代码里对应 4 种 `choice`：
+- `keep-planning`
+- `execute`
+- `manual-execute`
+- `clear-and-execute`
+
+这 4 个分支的真实行为可以直接记成：
+
+1. `keep-planning`
+- 不退出 plan mode
+- 把用户反馈包装成字符串返回给模型
+- 让模型继续改 plan，之后再次调用 `exit_plan_mode`
+
+2. `execute`
+- 退出 plan mode
+- 把权限切到 `acceptEdits`
+- 保留当前上下文
+- 把“已批准 plan”作为 tool result 返回，让模型继续实现
+
+3. `manual-execute`
+- 退出 plan mode
+- 权限恢复到进入 plan 之前的模式，通常是 `prePlanMode || "default"`
+- 把 plan 内容返回出来，但不强制切到 `acceptEdits`
+
+4. `clear-and-execute`
+- 退出 plan mode
+- 权限切到 `acceptEdits`
+- 调 `clearHistoryKeepSystem()`
+- 再把批准后的 plan 作为“新的起点”交回主循环继续执行
+
 其中最特别的是：
 
 ```ts
@@ -1232,9 +1377,16 @@ this.contextCleared = true;
 - 而是给后面的 agent 主循环一个信号
 - 告诉它“这次 context 被清空了，下一步要把 plan 作为新的 user message 注入”
 
+这个信号在后面的主循环里会被消费：
+- Anthropic 路径下，会把返回文本塞回 `anthropicMessages` 的新 `user` 消息
+- OpenAI 路径下，也会把返回文本塞回新的 `user` 消息
+- 然后中断这轮原本的 tool result 追加流程，避免旧上下文再混回来
+
 如果没有 `planApprovalFn`：
 - 比如子代理场景
 - 就直接退出 plan mode，不走交互审批
+- 权限恢复到 `prePlanMode || "default"`
+- 然后把 plan 内容原样返回
 
 ### 11.6 `clearHistoryKeepSystem()`
 
@@ -1249,6 +1401,15 @@ this.contextCleared = true;
 所以它和 `clearHistory()` 的区别是：
 - `clearHistory()` 是 REPL 用户手动清空，会顺带重置 token 统计
 - `clearHistoryKeepSystem()` 是内部辅助方法，只做和 plan 流程相关的最小清理
+
+按现在的代码，它具体只做三件事：
+- 清空 `anthropicMessages`
+- 清空 `openaiMessages`
+- 如果是 OpenAI-compatible，重新补回第一条 `system` message
+
+另外它只把 `lastInputTokenCount` 归零：
+- 不会清空 `totalInputTokens`
+- 也不会清空 `totalOutputTokens`
 
 ### 11.7 `executeAgentTool(input)`
 
@@ -1269,6 +1430,27 @@ this.contextCleared = true;
 这里的关键设计：
 - 子代理本质上还是 `Agent`
 - 只是 system prompt、tools、permissionMode 不同
+
+默认值也值得记一下：
+
+```ts
+const type = (input.type || "general") as SubAgentType;
+const description = input.description || "sub-agent task";
+const prompt = input.prompt || "";
+```
+
+也就是：
+- 不传 `type` 时默认是 `general`
+- 不传 `description` 和 `prompt` 也不会报错，只会用默认值
+
+这个 sub-agent 的配置来源和 skill fork 也不完全一样：
+- `executeAgentTool()` 用的是 `getSubAgentConfig(type)`
+- 也就是每种子代理类型都有预定义的 `systemPrompt` 和 `tools`
+- 而 `executeSkillTool()` 的 fork 模式更像“按 skill 运行时结果动态生成一个子代理”
+
+权限模式上，当前实现是：
+- 如果主代理在 `plan`，子代理也继续 `plan`
+- 否则直接使用 `bypassPermissions`
 
 可以理解为：
 - 主代理会“递归地”创建更小的、隔离上下文的 Agent
@@ -1336,7 +1518,7 @@ this.tools.filter(t => result.allowedTools!.includes(t.name))
 - 摘要压缩
 - 本地多层压缩
 
-7. 用 `executeToolCall()` 把普通工具、skill、plan mode、sub-agent 这些能力统一接到工具系统上
+7. 用 `executeToolCall()` 把普通工具、skill、plan mode、sub-agent、MCP 工具统一接到工具系统上
 
 也就是说，这一大段代码的作用不是“和模型聊天的细节实现”，而是：
 
