@@ -1229,7 +1229,226 @@ OpenAI：
 
 ---
 
-## 8. 一句话总结
+## 8. 补充：消息数组是怎么组装和增长的
+
+前面我们一直在说“把消息历史交给 LLM，再把结果写回历史”。  
+如果你想更具体一点地理解，那么可以直接盯住 Python 版 `mini_claude` 里的 `self._anthropic_messages`。
+
+最关键的结论只有一句：
+
+```text
+消息数组的增长，主要发生在 _chat_anthropic()；
+_call_anthropic_stream() 负责产出本轮 response，
+然后 _chat_anthropic() 再把 assistant 和 tool_result 追加回历史。
+```
+
+### 8.1 历史数组从哪里开始
+
+初始化位置：
+- [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:219)
+
+```python
+self._anthropic_messages: list[dict] = []
+```
+
+这说明：
+- 它本质上就是一个普通 Python list
+- 后面每一轮都是往这个 list 继续 `append(...)`
+
+### 8.2 每轮开始：先 append 一条 user
+
+位置：
+- [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:837)
+
+```python
+self._anthropic_messages.append({"role": "user", "content": user_message})
+```
+
+如果用户说：
+
+```python
+"帮我修复 bug"
+```
+
+那一开始历史会变成：
+
+```python
+[
+  {"role": "user", "content": "帮我修复 bug"}
+]
+```
+
+### 8.3 发请求时：把整份历史原样作为 `messages` 送进模型
+
+位置：
+- [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:995)
+
+```python
+"messages": self._anthropic_messages,
+```
+
+这一步非常关键，因为它说明：
+- 模型每一轮看到的不是“只看当前一句”
+- 而是“看当前整个消息历史”
+
+所以 `self._anthropic_messages` 会越来越重要；它就是 Agent 的工作记忆。
+
+### 8.4 本轮 assistant 回复回来后：先 append assistant
+
+位置：
+- [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:907)
+
+```python
+self._anthropic_messages.append({
+    "role": "assistant",
+    "content": [self._block_to_dict(b) for b in response.content],
+})
+```
+
+这里做了两件事：
+
+1. 把本轮 assistant 回复写回历史
+2. 把 SDK 的 content block 转成普通 dict，再存进 list
+
+转换函数在这里：
+- [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:973)
+
+也就是说，像：
+- `text`
+- `tool_use`
+
+这些 block 都是在这里被装进消息数组的。
+
+如果本轮模型回复的是：
+
+```python
+[
+  {"type": "text", "text": "我先读一下文件。"},
+  {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"file_path": "agent.py"}}
+]
+```
+
+那么历史会长成：
+
+```python
+[
+  {"role": "user", "content": "帮我修复 bug"},
+  {
+    "role": "assistant",
+    "content": [
+      {"type": "text", "text": "我先读一下文件。"},
+      {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"file_path": "agent.py"}}
+    ]
+  }
+]
+```
+
+### 8.5 工具跑完后：把结果再 append 成一条 user
+
+位置：
+- 收集 `tool_results`： [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:925)
+- 真正 append： [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:966)
+
+```python
+self._anthropic_messages.append({"role": "user", "content": tool_results})
+```
+
+这就是 Anthropic 路径最重要的格式特点：
+- assistant 里放 `tool_use`
+- 下一条 user 里放 `tool_result`
+
+如果 `read_file` 返回了文件内容，那么历史会继续长成：
+
+```python
+[
+  {"role": "user", "content": "帮我修复 bug"},
+  {
+    "role": "assistant",
+    "content": [
+      {"type": "text", "text": "我先读一下文件。"},
+      {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"file_path": "agent.py"}}
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {"type": "tool_result", "tool_use_id": "toolu_1", "content": "文件内容..."}
+    ]
+  }
+]
+```
+
+然后 `while True` 不会结束，会重新回到循环顶部，再把这 3 条消息一起发给模型。
+
+### 8.6 为什么会“越聊越长”
+
+因为每轮都在重复这三个 append 动作：
+
+1. 新 user 输入进历史
+2. assistant 回复进历史
+3. 工具结果进历史
+
+所以你可以把一轮一轮的增长理解成：
+
+```python
+第 1 轮:
+[
+  {"role": "user", "content": "帮我修复 bug"},
+  {"role": "assistant", "content": [text, tool_use(read_file)]},
+  {"role": "user", "content": [tool_result("文件内容...")]}
+]
+
+第 2 轮:
+[
+  ...前 3 条,
+  {"role": "assistant", "content": [text, tool_use(edit_file)]},
+  {"role": "user", "content": [tool_result("编辑成功")]}
+]
+
+第 3 轮:
+[
+  ...前 5 条,
+  {"role": "assistant", "content": [text("已修复!")]}
+]
+```
+
+这里第 3 轮的关键是：
+- assistant 仍然会先被 append 进历史
+- 但如果没有任何 `tool_use`，循环就结束
+
+对应代码：
+- assistant append： [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:907)
+- 无工具就 `break`： [agent.py](/home/mihoyohb/Claude_Code_Repo/claude-codeMihoyohb/python/mini_claude/agent.py:912)
+
+```python
+if not tool_uses:
+    break
+```
+
+所以最后一轮只有 assistant 文本，没有新的 `tool_result` user 消息。
+
+### 8.7 职责怎么分工
+
+这两个函数最好分开记：
+
+- `_call_anthropic_stream()`：
+  - 负责和 Anthropic 流式通信
+  - 负责拿到本轮 `response`
+  - 负责在 streaming 过程中把 `tool_use` 的输入 JSON 拼起来
+  - 负责在条件满足时提前触发工具执行
+
+- `_chat_anthropic()`：
+  - 负责维护 `self._anthropic_messages`
+  - 负责把 user / assistant / tool_result 一轮轮 append 回历史
+  - 负责决定是否继续下一轮，还是 `break`
+
+一句话记忆：
+- `_call_anthropic_stream()` 是“拿本轮结果”
+- `_chat_anthropic()` 是“养大整份消息历史”
+
+---
+
+## 9. 一句话总结
 
 把这两个函数读懂之后，你就会发现：
 
