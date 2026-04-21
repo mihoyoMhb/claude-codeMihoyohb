@@ -272,7 +272,7 @@ class Agent:
             model = self.model
             async def _sq_oai(system: str, user_message: str) -> str:
                 resp = await client.chat.completions.create(
-                    model=model, max_tokens=256,
+                    model=model,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_message},
@@ -472,7 +472,6 @@ class Agent:
         last_user_msg = self._openai_messages[-1]
         summary_resp = await self._openai_client.chat.completions.create(
             model=self.model,
-            max_tokens=2048,
             messages=[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
                 *self._openai_messages[1:-1],
@@ -1200,7 +1199,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         async def _do():
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
-                max_tokens=16384,
                 tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
                 messages=self._openai_messages,
                 stream=True,
